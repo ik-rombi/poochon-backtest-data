@@ -1,0 +1,4 @@
+name: poochon-backtest-data-runtime
+runtime:
+  name: python
+description: Ephemeral AWS runtime resources for Poochon backtest data

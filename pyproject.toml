@@ -1,0 +1,37 @@
+[project]
+name = "poochon-backtest-data"
+version = "0.1.0"
+description = "AWS-backed Hyperliquid historical ingestion and replay materialization service"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "boto3>=1.37",
+    "botocore>=1.37",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "lz4>=4.4",
+    "orjson>=3.10",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.8",
+    "pyarrow>=20.0.0",
+    "python-dateutil>=2.9",
+    "uvicorn[standard]>=0.34",
+    "zstandard>=0.23",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.26",
+]
+
+[project.scripts]
+poochon-backtest-data = "poochon_backtest_data.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

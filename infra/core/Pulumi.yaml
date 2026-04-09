@@ -1,0 +1,4 @@
+name: poochon-backtest-data-core
+runtime:
+  name: python
+description: Persistent AWS resources for Poochon backtest data
