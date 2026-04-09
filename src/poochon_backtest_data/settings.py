@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     coverage_table_name: str | None = None
     replay_table_name: str | None = None
     replay_state_machine_arn: str | None = None
+    telonex_api_key: str | None = None
 
     request_payer: str = Field(default="requester")
 

@@ -7,7 +7,15 @@ import uvicorn
 
 from .api import create_app
 from .hyperliquid import backfill_day, ingest_range, normalize_day
-from .models import IngestionRequest, MarketRef, MarketType, ReplayRequest
+from .models import (
+    IngestionRequest,
+    MarketRef,
+    MarketType,
+    PolymarketReplayCreateRequest,
+    ReplayRequest,
+    Venue,
+)
+from .polymarket_telonex import ingest_market, resolve_market
 from .service import materialize_replay
 from .settings import get_settings
 from .storage import CoverageRepository, ReplayRepository, S3Store, boto3_session
@@ -45,6 +53,13 @@ def _market_ref_from_args(args: argparse.Namespace) -> MarketRef:
     )
 
 
+def _require_telonex_api_key() -> str:
+    settings = get_settings()
+    if not settings.telonex_api_key:
+        raise RuntimeError("POOCHON_TELONEX_API_KEY is required")
+    return settings.telonex_api_key
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="poochon-backtest-data")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -70,6 +85,15 @@ def main() -> None:
     _add_market_args(materialize_parser)
     materialize_parser.add_argument("--date", required=True)
     materialize_parser.add_argument("--depth", type=int, default=20)
+
+    polymarket_ingest_parser = subparsers.add_parser("polymarket-ingest-market")
+    polymarket_ingest_parser.add_argument("--slug", required=True)
+    polymarket_ingest_parser.add_argument("--outcome", required=True)
+
+    polymarket_materialize_parser = subparsers.add_parser("polymarket-materialize-replay")
+    polymarket_materialize_parser.add_argument("--slug", required=True)
+    polymarket_materialize_parser.add_argument("--outcome", required=True)
+    polymarket_materialize_parser.add_argument("--depth", type=int, default=5)
 
     args = parser.parse_args()
     settings = get_settings()
@@ -101,8 +125,8 @@ def main() -> None:
         )
         return
 
-    market = _market_ref_from_args(args)
     if args.command == "backfill-day":
+        market = _market_ref_from_args(args)
         backfill_day(
             s3_store,
             coverage_repo,
@@ -113,6 +137,7 @@ def main() -> None:
         return
 
     if args.command == "normalize-day":
+        market = _market_ref_from_args(args)
         normalize_day(s3_store, coverage_repo, market=market, date=args.date)
         return
 
@@ -123,6 +148,43 @@ def main() -> None:
                 instrument=args.instrument,
                 date=args.date,
                 depth=args.depth,
+            ),
+            s3_store=s3_store,
+            coverage_repo=coverage_repo,
+            replay_repo=replay_repo,
+        )
+        return
+
+    if args.command == "polymarket-ingest-market":
+        ingest_market(
+            s3_store,
+            coverage_repo,
+            request=PolymarketReplayCreateRequest(slug=args.slug, outcome=args.outcome),
+            telonex_api_key=_require_telonex_api_key(),
+        )
+        return
+
+    if args.command == "polymarket-materialize-replay":
+        resolution = resolve_market(
+            PolymarketReplayCreateRequest(
+                slug=args.slug,
+                outcome=args.outcome,
+                depth=args.depth,
+            )
+        )
+        materialize_replay(
+            request=ReplayRequest(
+                venue=Venue.POLYMARKET,
+                market_type=MarketType.BINARY,
+                instrument=resolution.instrument,
+                depth=args.depth,
+                slug=resolution.slug,
+                outcome=resolution.outcome,
+                market_id=resolution.market_id,
+                asset_id=resolution.asset_id,
+                dates=resolution.dates,
+                start_ts_ms=resolution.start_ts_ms,
+                end_ts_ms=resolution.end_ts_ms,
             ),
             s3_store=s3_store,
             coverage_repo=coverage_repo,

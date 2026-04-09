@@ -3,7 +3,12 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from poochon_backtest_data.api import create_app
-from poochon_backtest_data.models import ReplayRequest, ReplayStatus, new_pending_replay
+from poochon_backtest_data.models import (
+    PolymarketReplayCreateRequest,
+    ReplayRequest,
+    ReplayStatus,
+    new_pending_replay,
+)
 from poochon_backtest_data.settings import Settings
 
 
@@ -14,6 +19,9 @@ class FakeReplayService:
         )
 
     def submit_replay(self, request: ReplayRequest):
+        return self.record
+
+    def submit_polymarket_replay(self, request: PolymarketReplayCreateRequest):
         return self.record
 
     def get_replay(self, replay_id: str):
@@ -46,3 +54,12 @@ def test_api_streams_ndjson_when_replay_ready() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/x-ndjson")
     assert '"Trade"' in response.text
+
+
+def test_api_accepts_polymarket_replay_creation() -> None:
+    client = TestClient(create_app(Settings(), replay_service=FakeReplayService()))
+    response = client.post(
+        "/api/v1/polymarket/replays",
+        json={"slug": "btc-updown-5m-1775181000", "outcome": "Up", "depth": 5},
+    )
+    assert response.status_code == 202

@@ -14,6 +14,7 @@ prefix = config.get("namePrefix") or "poochon-backtest-data"
 core_stack_ref = config.require("coreStackRef")
 
 ingestion_mode = (config.get("ingestionMode") or "disabled").lower()
+ingestion_venue = (config.get("ingestionVenue") or "hyperliquid").lower()
 ingestion_market_type = config.get("ingestionMarketType") or "perp"
 ingestion_instrument = config.get("ingestionInstrument") or "BTC"
 ingestion_start_date = config.get("ingestionStartDate")
@@ -22,6 +23,9 @@ ingestion_start_offset_days = config.get_int("ingestionStartOffsetDays")
 ingestion_end_offset_days = config.get_int("ingestionEndOffsetDays")
 ingestion_start_at = config.get("ingestionStartAt")
 cron_expression = config.get("cronExpression")
+ingestion_slug = config.get("ingestionSlug")
+ingestion_outcome = config.get("ingestionOutcome")
+telonex_api_key = config.get_secret("telonexApiKey")
 
 core = pulumi.StackReference(core_stack_ref)
 bucket_name = core.require_output("data_bucket_name")
@@ -34,21 +38,30 @@ availability_zones = aws.get_availability_zones(state="available")
 
 
 def build_ingestion_input() -> dict[str, int | str]:
+    if ingestion_mode == "disabled":
+        return {}
+    payload: dict[str, int | str] = {"venue": ingestion_venue}
+    if ingestion_venue == "polymarket":
+        if ingestion_mode == "cron":
+            raise ValueError("cron ingestion is not supported for polymarket")
+        if not ingestion_slug or not ingestion_outcome:
+            raise ValueError("ingestionSlug and ingestionOutcome are required for polymarket ingestion")
+        payload["slug"] = ingestion_slug
+        payload["outcome"] = ingestion_outcome
+        return payload
+    if ingestion_venue != "hyperliquid":
+        raise ValueError("ingestionVenue must be hyperliquid or polymarket")
     explicit = ingestion_start_date is not None or ingestion_end_date is not None
     relative = (
         ingestion_start_offset_days is not None or ingestion_end_offset_days is not None
     )
-    if ingestion_mode == "disabled":
-        return {}
     if explicit == relative:
         raise ValueError(
             "configure either ingestionStartDate/ingestionEndDate or "
             "ingestionStartOffsetDays/ingestionEndOffsetDays"
         )
-    payload: dict[str, int | str] = {
-        "market_type": ingestion_market_type,
-        "instrument": ingestion_instrument,
-    }
+    payload["market_type"] = ingestion_market_type
+    payload["instrument"] = ingestion_instrument
     if explicit:
         if ingestion_start_date is None or ingestion_end_date is None:
             raise ValueError("ingestionStartDate and ingestionEndDate are both required")
@@ -71,6 +84,8 @@ if ingestion_mode == "cron" and not cron_expression:
     raise ValueError("cronExpression is required when ingestionMode=cron")
 if ingestion_mode not in {"disabled", "once", "cron"}:
     raise ValueError("ingestionMode must be one of disabled, once, or cron")
+if ingestion_venue == "polymarket" and ingestion_mode != "disabled" and telonex_api_key is None:
+    raise ValueError("telonexApiKey is required for polymarket ingestion")
 
 
 def assume_role_policy(service: str) -> str:
@@ -226,6 +241,37 @@ aws.iam.RolePolicyAttachment(
     policy_arn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
 )
 
+telonex_secret = None
+if telonex_api_key is not None:
+    telonex_secret = aws.secretsmanager.Secret(
+        "telonex-api-key-secret",
+        name=f"{prefix}-{stack}-telonex-api-key",
+        recovery_window_in_days=0,
+    )
+    aws.secretsmanager.SecretVersion(
+        "telonex-api-key-secret-version",
+        secret_id=telonex_secret.id,
+        secret_string=telonex_api_key,
+    )
+    aws.iam.RolePolicy(
+        "ecs-execution-secrets-policy",
+        role=execution_role.id,
+        policy=telonex_secret.arn.apply(
+            lambda arn: json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": ["secretsmanager:GetSecretValue"],
+                            "Resource": [arn],
+                        }
+                    ],
+                }
+            )
+        ),
+    )
+
 task_role = aws.iam.Role(
     "ecs-task-role",
     assume_role_policy=assume_role_policy("ecs-tasks.amazonaws.com"),
@@ -299,10 +345,19 @@ def container_definitions(
     image_name: pulumi.Input[str],
     command: list[str],
     env: dict[str, pulumi.Input[str]],
+    secrets: dict[str, pulumi.Input[str]] | None = None,
     log_group_name: pulumi.Input[str],
     port: int | None = None,
 ) -> pulumi.Output[str]:
-    return pulumi.Output.all(image=image_name, log_group=log_group_name, **env).apply(
+    secrets = secrets or {}
+    env_outputs = {f"env__{name}": value for name, value in env.items()}
+    secret_outputs = {f"secret__{name}": value for name, value in secrets.items()}
+    return pulumi.Output.all(
+        image=image_name,
+        log_group=log_group_name,
+        **env_outputs,
+        **secret_outputs,
+    ).apply(
         lambda values: json.dumps(
             [
                 {
@@ -311,8 +366,12 @@ def container_definitions(
                     "essential": True,
                     "command": command,
                     "environment": [
-                        {"name": name, "value": str(values[name])}
+                        {"name": name, "value": str(values[f"env__{name}"])}
                         for name in env
+                    ],
+                    "secrets": [
+                        {"name": name, "valueFrom": str(values[f"secret__{name}"])}
+                        for name in secrets
                     ],
                     "portMappings": (
                         [{"containerPort": port, "hostPort": port, "protocol": "tcp"}]
@@ -339,6 +398,11 @@ base_env = {
     "POOCHON_COVERAGE_TABLE_NAME": coverage_table_name,
     "POOCHON_REPLAY_TABLE_NAME": replay_table_name,
 }
+ingest_container_secrets = (
+    {"POOCHON_TELONEX_API_KEY": telonex_secret.arn}
+    if telonex_secret is not None
+    else {}
+)
 
 runtime_platform = aws.ecs.TaskDefinitionRuntimePlatformArgs(
     cpu_architecture="ARM64",
@@ -372,6 +436,7 @@ ingest_task_definition = aws.ecs.TaskDefinition(
             ingestion_end_date or "1970-01-01",
         ],
         env=base_env,
+        secrets=ingest_container_secrets,
         log_group_name=log_group.name,
     ),
 )
@@ -508,11 +573,31 @@ ingestion_definition = pulumi.Output.all(
         ingest_task_definition.arn,
         "States.Array('python','-m','poochon_backtest_data.cli','ingest-range','--market-type',$.market_type,'--instrument',$.instrument,'--start-offset-days',States.Format('{}',$.start_offset_days),'--end-offset-days',States.Format('{}',$.end_offset_days))",
     ),
+    polymarket=ecs_run_task_state(
+        ingest_task_definition.arn,
+        "States.Array('python','-m','poochon_backtest_data.cli','polymarket-ingest-market','--slug',$.slug,'--outcome',$.outcome)",
+    ),
 ).apply(
     lambda states: json.dumps(
         {
-            "StartAt": "ResolveWindowMode",
+            "StartAt": "ResolveVenue",
             "States": {
+                "ResolveVenue": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Variable": "$.venue",
+                            "StringEquals": "polymarket",
+                            "Next": "IngestPolymarket",
+                        },
+                        {
+                            "Variable": "$.venue",
+                            "StringEquals": "hyperliquid",
+                            "Next": "ResolveWindowMode",
+                        },
+                    ],
+                    "Default": "MissingVenue",
+                },
                 "ResolveWindowMode": {
                     "Type": "Choice",
                     "Choices": [
@@ -531,6 +616,12 @@ ingestion_definition = pulumi.Output.all(
                 },
                 "IngestRangeExplicit": {**states["explicit"], "End": True},
                 "IngestRangeRelative": {**states["relative"], "End": True},
+                "IngestPolymarket": {**states["polymarket"], "End": True},
+                "MissingVenue": {
+                    "Type": "Fail",
+                    "Error": "MissingVenue",
+                    "Cause": "A supported venue is required",
+                },
                 "MissingWindow": {
                     "Type": "Fail",
                     "Error": "MissingWindow",
@@ -550,11 +641,38 @@ ingestion_state_machine = aws.sfn.StateMachine(
 materialize_definition = ecs_run_task_state(
     materialize_task_definition.arn,
     "States.Array('python','-m','poochon_backtest_data.cli','materialize-replay','--market-type',$.market_type,'--instrument',$.instrument,'--date',$.date,'--depth',States.Format('{}',$.depth))",
+)
+
+materialize_definition = pulumi.Output.all(
+    hyperliquid=materialize_definition,
+    polymarket=ecs_run_task_state(
+        materialize_task_definition.arn,
+        "States.Array('python','-m','poochon_backtest_data.cli','polymarket-materialize-replay','--slug',$.slug,'--outcome',$.outcome,'--depth',States.Format('{}',$.depth))",
+    ),
 ).apply(
-    lambda state: json.dumps(
+    lambda states: json.dumps(
         {
-            "StartAt": "MaterializeReplay",
-            "States": {"MaterializeReplay": {**state, "End": True}},
+            "StartAt": "ResolveVenue",
+            "States": {
+                "ResolveVenue": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Variable": "$.venue",
+                            "StringEquals": "polymarket",
+                            "Next": "MaterializePolymarketReplay",
+                        },
+                        {
+                            "Variable": "$.venue",
+                            "StringEquals": "hyperliquid",
+                            "Next": "MaterializeHyperliquidReplay",
+                        },
+                    ],
+                    "Default": "MaterializeHyperliquidReplay",
+                },
+                "MaterializeHyperliquidReplay": {**states["hyperliquid"], "End": True},
+                "MaterializePolymarketReplay": {**states["polymarket"], "End": True},
+            },
         }
     )
 )

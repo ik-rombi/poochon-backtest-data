@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .models import ReplayRequest, ReplayStatus
+from .models import PolymarketReplayCreateRequest, ReplayRequest, ReplayStatus
 from .service import ReplayService
 from .settings import Settings, get_settings
 from .storage import CoverageRepository, ReplayRepository, S3Store, boto3_session
@@ -38,6 +38,15 @@ def create_app(
     def create_replay(request: ReplayRequest):
         try:
             record = replay_service.submit_replay(request)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        status_code = 200 if record.status == ReplayStatus.READY else 202
+        return JSONResponse(status_code=status_code, content=record.model_dump(mode="json"))
+
+    @app.post("/api/v1/polymarket/replays")
+    def create_polymarket_replay(request: PolymarketReplayCreateRequest):
+        try:
+            record = replay_service.submit_polymarket_replay(request)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         status_code = 200 if record.status == ReplayStatus.READY else 202
