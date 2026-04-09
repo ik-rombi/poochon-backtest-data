@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from poochon_backtest_data.hyperliquid import iso_to_epoch_ms, parse_l2_snapshot, parse_trade
+from poochon_backtest_data.hyperliquid import (
+    iso_to_epoch_ms,
+    l2_source_key,
+    parse_l2_snapshot,
+    parse_trade,
+    trade_source_key,
+)
 
 
 def test_iso_to_epoch_ms_handles_nanoseconds() -> None:
@@ -37,3 +43,8 @@ def test_parse_l2_snapshot_keeps_book_payload_for_materialization() -> None:
     assert snapshot.ts_ms == 1705309199653
     assert '"px":"42706.0"' in snapshot.bids_json
     assert snapshot.source_line_number == 14
+
+
+def test_source_keys_use_compact_date_paths() -> None:
+    assert l2_source_key("BTC", "2025-05-24", 0) == "market_data/20250524/0/l2Book/BTC.lz4"
+    assert trade_source_key("2025-05-24", 0) == "node_trades/hourly/20250524/0.lz4"

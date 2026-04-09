@@ -189,6 +189,8 @@ task_role = aws.iam.Role(
 
 bucket_arn = bucket_name.apply(lambda name: f"arn:aws:s3:::{name}")
 bucket_objects_arn = bucket_name.apply(lambda name: f"arn:aws:s3:::{name}/*")
+hyperliquid_archive_objects_arn = "arn:aws:s3:::hyperliquid-archive/*"
+hyperliquid_trades_objects_arn = "arn:aws:s3:::hl-mainnet-node-data/*"
 
 aws.iam.RolePolicy(
     "ecs-task-data-policy",
@@ -209,6 +211,14 @@ aws.iam.RolePolicy(
                         "Effect": "Allow",
                         "Action": ["s3:GetObject", "s3:PutObject", "s3:HeadObject"],
                         "Resource": [args[1]],
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject"],
+                        "Resource": [
+                            hyperliquid_archive_objects_arn,
+                            hyperliquid_trades_objects_arn,
+                        ],
                     },
                     {
                         "Effect": "Allow",
@@ -436,6 +446,7 @@ def ecs_run_task_state(task_definition_arn: pulumi.Input[str], command_state: st
         lambda values: {
             "Type": "Task",
             "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "ResultPath": None,
             "Parameters": {
                 "LaunchType": "FARGATE",
                 "Cluster": values["cluster"],

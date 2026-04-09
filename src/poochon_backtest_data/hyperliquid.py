@@ -30,12 +30,16 @@ L2_SOURCE_BUCKET = "hyperliquid-archive"
 TRADE_SOURCE_BUCKET = "hl-mainnet-node-data"
 
 
+def source_date(date: str) -> str:
+    return date.replace("-", "")
+
+
 def l2_source_key(symbol: str, date: str, hour: int) -> str:
-    return f"market_data/{date}/{hour}/l2Book/{symbol}.lz4"
+    return f"market_data/{source_date(date)}/{hour}/l2Book/{symbol}.lz4"
 
 
 def trade_source_key(date: str, hour: int) -> str:
-    return f"node_trades/hourly/{date}/{hour}.lz4"
+    return f"node_trades/hourly/{source_date(date)}/{hour}.lz4"
 
 
 def requester_pays_copy(
