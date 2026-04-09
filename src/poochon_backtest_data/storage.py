@@ -55,12 +55,15 @@ class S3Store:
         return response["Body"].read()
 
     def exists(self, key: str) -> bool:
+        return self.object_size(key) is not None
+
+    def object_size(self, key: str) -> int | None:
         try:
-            self.client.head_object(Bucket=self.bucket, Key=key)
-            return True
+            response = self.client.head_object(Bucket=self.bucket, Key=key)
+            return int(response["ContentLength"])
         except ClientError as error:
             if error.response["ResponseMetadata"]["HTTPStatusCode"] == 404:
-                return False
+                return None
             raise
 
     def stream_zstd(self, key: str, chunk_size: int = 64 * 1024) -> Iterator[bytes]:

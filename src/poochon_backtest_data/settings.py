@@ -15,11 +15,6 @@ class Settings(BaseSettings):
     replay_table_name: str | None = None
     replay_state_machine_arn: str | None = None
 
-    proof_symbol: str = "BTC"
-    proof_market: str = "perp"
-    proof_date: str = "2025-05-24"
-    proof_mode: str = "l2-trade"
-
     request_payer: str = Field(default="requester")
 
     model_config = SettingsConfigDict(

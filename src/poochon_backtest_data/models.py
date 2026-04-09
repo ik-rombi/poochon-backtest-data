@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date as date_cls, datetime, timedelta
 from enum import StrEnum
 import hashlib
+from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,28 +27,135 @@ class DatasetKind(StrEnum):
     NORMALIZED_TRADES = "normalized_trades"
 
 
-class ReplayRequest(BaseModel):
+class MarketType(StrEnum):
+    PERP = "perp"
+    SPOT = "spot"
+
+
+class IngestionMode(StrEnum):
+    DISABLED = "disabled"
+    ONCE = "once"
+    CRON = "cron"
+
+
+def _parse_date(value: str) -> date_cls:
+    try:
+        return date_cls.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"invalid ISO date: {value}") from error
+
+
+class MarketRef(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     venue: str = "hyperliquid"
-    market: str = "perp"
-    symbol: str
+    market_type: MarketType
+    instrument: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_legacy_aliases(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            if "market_type" not in value and "market" in value:
+                value["market_type"] = value["market"]
+            if "instrument" not in value and "symbol" in value:
+                value["instrument"] = value["symbol"]
+        return value
+
+    @model_validator(mode="after")
+    def validate_market(self) -> "MarketRef":
+        if self.venue != "hyperliquid":
+            raise ValueError("only hyperliquid venue is supported")
+        if not self.instrument.strip():
+            raise ValueError("instrument is required")
+        return self
+
+    def encoded_instrument(self) -> str:
+        return quote(self.instrument, safe="")
+
+
+class ReplayRequest(MarketRef):
     date: str
     mode: str = "l2-trade"
+    depth: int = Field(default=20, ge=1)
 
     @model_validator(mode="after")
     def validate_request(self) -> "ReplayRequest":
-        if self.venue != "hyperliquid":
-            raise ValueError("only hyperliquid venue is supported")
-        if self.market != "perp":
-            raise ValueError("only perp market is supported")
+        _parse_date(self.date)
         if self.mode != "l2-trade":
             raise ValueError("only l2-trade replay mode is supported")
         return self
 
     def replay_id(self) -> str:
-        canonical = f"{self.venue}|{self.market}|{self.symbol}|{self.date}|{self.mode}"
+        canonical = (
+            f"{self.venue}|{self.market_type.value}|{self.instrument}|"
+            f"{self.date}|{self.mode}|depth={self.depth}"
+        )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+    def market_ref(self) -> MarketRef:
+        return MarketRef(
+            venue=self.venue,
+            market_type=self.market_type,
+            instrument=self.instrument,
+        )
+
+
+class IngestionRequest(MarketRef):
+    start_date: str | None = None
+    end_date: str | None = None
+    start_offset_days: int | None = None
+    end_offset_days: int | None = None
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "IngestionRequest":
+        explicit = self.start_date is not None or self.end_date is not None
+        relative = self.start_offset_days is not None or self.end_offset_days is not None
+        if explicit == relative:
+            raise ValueError(
+                "provide either start_date/end_date or start_offset_days/end_offset_days"
+            )
+        if explicit:
+            if self.start_date is None or self.end_date is None:
+                raise ValueError("start_date and end_date are both required")
+            start = _parse_date(self.start_date)
+            end = _parse_date(self.end_date)
+            if end < start:
+                raise ValueError("end_date must be on or after start_date")
+        else:
+            if self.start_offset_days is None or self.end_offset_days is None:
+                raise ValueError("start_offset_days and end_offset_days are both required")
+            if self.end_offset_days < self.start_offset_days:
+                raise ValueError("end_offset_days must be >= start_offset_days")
+        return self
+
+    def resolve_window(self, *, today: date_cls | None = None) -> tuple[str, str]:
+        base = today or datetime.now(tz=UTC).date()
+        if self.start_date is not None and self.end_date is not None:
+            return self.start_date, self.end_date
+        assert self.start_offset_days is not None
+        assert self.end_offset_days is not None
+        start = base + timedelta(days=self.start_offset_days)
+        end = base + timedelta(days=self.end_offset_days)
+        return start.isoformat(), end.isoformat()
+
+    def iter_dates(self, *, today: date_cls | None = None) -> list[str]:
+        start_raw, end_raw = self.resolve_window(today=today)
+        start = _parse_date(start_raw)
+        end = _parse_date(end_raw)
+        return [
+            (start + timedelta(days=offset)).isoformat()
+            for offset in range((end - start).days + 1)
+        ]
+
+    def day_request(self, date: str) -> MarketRef:
+        _parse_date(date)
+        return MarketRef(
+            venue=self.venue,
+            market_type=self.market_type,
+            instrument=self.instrument,
+        )
 
 
 class ReplayRecord(BaseModel):
@@ -65,7 +173,9 @@ class ReplayRecord(BaseModel):
 class CoverageRecord(BaseModel):
     pk: str
     dataset_kind: DatasetKind
-    symbol: str
+    venue: str = "hyperliquid"
+    market_type: MarketType = MarketType.PERP
+    instrument: str
     date: str
     hour: str
     status: CoverageStatus
@@ -75,21 +185,36 @@ class CoverageRecord(BaseModel):
     updated_at: str
     source: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def apply_legacy_aliases(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            if "instrument" not in value and "symbol" in value:
+                value["instrument"] = value["symbol"]
+            if "market_type" not in value and "market" in value:
+                value["market_type"] = value["market"]
+        return value
+
 
 def utc_now_iso() -> str:
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat()
 
 
-def coverage_pk(dataset_kind: DatasetKind, symbol: str, date: str, hour: str) -> str:
-    return f"{dataset_kind.value}#{symbol}#{date}#{hour}"
+def coverage_pk(dataset_kind: DatasetKind, market: MarketRef, date: str, hour: str) -> str:
+    return (
+        f"{dataset_kind.value}#{market.venue}#{market.market_type.value}#"
+        f"{market.encoded_instrument()}#{date}#{hour}"
+    )
 
 
 def replay_s3_key(request: ReplayRequest) -> str:
     replay_id = request.replay_id()
     return (
         "replays/"
-        f"venue={request.venue}/market={request.market}/symbol={request.symbol}/"
-        f"date={request.date}/mode={request.mode}/replay_id={replay_id}/events.jsonl.zst"
+        f"venue={request.venue}/market_type={request.market_type.value}/"
+        f"instrument={request.encoded_instrument()}/date={request.date}/"
+        f"mode={request.mode}/depth={request.depth}/replay_id={replay_id}/events.jsonl.zst"
     )
 
 
@@ -97,43 +222,48 @@ def replay_manifest_s3_key(request: ReplayRequest) -> str:
     replay_id = request.replay_id()
     return (
         "replays/"
-        f"venue={request.venue}/market={request.market}/symbol={request.symbol}/"
-        f"date={request.date}/mode={request.mode}/replay_id={replay_id}/manifest.json"
+        f"venue={request.venue}/market_type={request.market_type.value}/"
+        f"instrument={request.encoded_instrument()}/date={request.date}/"
+        f"mode={request.mode}/depth={request.depth}/replay_id={replay_id}/manifest.json"
     )
 
 
-def normalized_l2_s3_key(symbol: str, date: str, hour: int) -> str:
+def normalized_l2_s3_key(market: MarketRef, date: str, hour: int) -> str:
     return (
         "normalized/hyperliquid/l2_snapshot/"
-        f"date={date}/hour={hour:02d}/symbol={symbol}/part-000.parquet"
+        f"market_type={market.market_type.value}/date={date}/hour={hour:02d}/"
+        f"instrument={market.encoded_instrument()}/part-000.parquet"
     )
 
 
-def normalized_trade_s3_key(symbol: str, date: str, hour: int) -> str:
+def normalized_trade_s3_key(market: MarketRef, date: str, hour: int) -> str:
     return (
         "normalized/hyperliquid/trade/"
-        f"date={date}/hour={hour:02d}/symbol={symbol}/part-000.parquet"
+        f"market_type={market.market_type.value}/date={date}/hour={hour:02d}/"
+        f"instrument={market.encoded_instrument()}/part-000.parquet"
     )
 
 
-def raw_l2_s3_key(symbol: str, date: str, hour: int) -> str:
+def raw_l2_s3_key(market: MarketRef, date: str, hour: int) -> str:
     return (
         "raw/hyperliquid/l2book/"
-        f"date={date}/hour={hour:02d}/symbol={symbol}/{symbol}.lz4"
+        f"market_type={market.market_type.value}/date={date}/hour={hour:02d}/"
+        f"instrument={market.encoded_instrument()}/{market.encoded_instrument()}.lz4"
     )
 
 
-def raw_trade_s3_key(symbol: str, date: str, hour: int) -> str:
+def raw_trade_s3_key(market: MarketRef, date: str, hour: int) -> str:
     return (
         "raw/hyperliquid/node_trades/"
-        f"date={date}/hour={hour:02d}/symbol={symbol}/part-{hour:02d}.lz4"
+        f"market_type={market.market_type.value}/date={date}/hour={hour:02d}/"
+        f"instrument={market.encoded_instrument()}/part-{hour:02d}.lz4"
     )
 
 
 @dataclass(frozen=True)
 class NormalizedL2Snapshot:
     ts_ms: int
-    symbol: str
+    instrument: str
     bids_json: str
     asks_json: str
     source_hour: int
@@ -143,7 +273,7 @@ class NormalizedL2Snapshot:
 @dataclass(frozen=True)
 class NormalizedTrade:
     ts_ms: int
-    symbol: str
+    instrument: str
     side: str
     px: float
     sz: float

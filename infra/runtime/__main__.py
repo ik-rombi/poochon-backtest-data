@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 
@@ -12,12 +11,17 @@ import pulumi_docker as docker
 stack = pulumi.get_stack()
 config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
-proof_symbol = config.get("proofSymbol") or "BTC"
-proof_date = config.get("proofDate") or "2025-05-24"
-bootstrap_at = config.get("bootstrapAt") or (
-    datetime.now(tz=UTC) + timedelta(minutes=10)
-).strftime("%Y-%m-%dT%H:%M:%S")
 core_stack_ref = config.require("coreStackRef")
+
+ingestion_mode = (config.get("ingestionMode") or "disabled").lower()
+ingestion_market_type = config.get("ingestionMarketType") or "perp"
+ingestion_instrument = config.get("ingestionInstrument") or "BTC"
+ingestion_start_date = config.get("ingestionStartDate")
+ingestion_end_date = config.get("ingestionEndDate")
+ingestion_start_offset_days = config.get_int("ingestionStartOffsetDays")
+ingestion_end_offset_days = config.get_int("ingestionEndOffsetDays")
+ingestion_start_at = config.get("ingestionStartAt")
+cron_expression = config.get("cronExpression")
 
 core = pulumi.StackReference(core_stack_ref)
 bucket_name = core.require_output("data_bucket_name")
@@ -27,6 +31,46 @@ replay_table_name = core.require_output("replay_table_name")
 region = aws.get_region_output()
 caller = aws.get_caller_identity_output()
 availability_zones = aws.get_availability_zones(state="available")
+
+
+def build_ingestion_input() -> dict[str, int | str]:
+    explicit = ingestion_start_date is not None or ingestion_end_date is not None
+    relative = (
+        ingestion_start_offset_days is not None or ingestion_end_offset_days is not None
+    )
+    if ingestion_mode == "disabled":
+        return {}
+    if explicit == relative:
+        raise ValueError(
+            "configure either ingestionStartDate/ingestionEndDate or "
+            "ingestionStartOffsetDays/ingestionEndOffsetDays"
+        )
+    payload: dict[str, int | str] = {
+        "market_type": ingestion_market_type,
+        "instrument": ingestion_instrument,
+    }
+    if explicit:
+        if ingestion_start_date is None or ingestion_end_date is None:
+            raise ValueError("ingestionStartDate and ingestionEndDate are both required")
+        payload["start_date"] = ingestion_start_date
+        payload["end_date"] = ingestion_end_date
+    else:
+        if ingestion_start_offset_days is None or ingestion_end_offset_days is None:
+            raise ValueError(
+                "ingestionStartOffsetDays and ingestionEndOffsetDays are both required"
+            )
+        payload["start_offset_days"] = ingestion_start_offset_days
+        payload["end_offset_days"] = ingestion_end_offset_days
+    return payload
+
+
+ingestion_input = build_ingestion_input()
+if ingestion_mode == "once" and not ingestion_start_at:
+    raise ValueError("ingestionStartAt is required when ingestionMode=once")
+if ingestion_mode == "cron" and not cron_expression:
+    raise ValueError("cronExpression is required when ingestionMode=cron")
+if ingestion_mode not in {"disabled", "once", "cron"}:
+    raise ValueError("ingestionMode must be one of disabled, once, or cron")
 
 
 def assume_role_policy(service: str) -> str:
@@ -189,7 +233,9 @@ task_role = aws.iam.Role(
 
 bucket_arn = bucket_name.apply(lambda name: f"arn:aws:s3:::{name}")
 bucket_objects_arn = bucket_name.apply(lambda name: f"arn:aws:s3:::{name}/*")
+hyperliquid_archive_bucket_arn = "arn:aws:s3:::hyperliquid-archive"
 hyperliquid_archive_objects_arn = "arn:aws:s3:::hyperliquid-archive/*"
+hyperliquid_trades_bucket_arn = "arn:aws:s3:::hl-mainnet-node-data"
 hyperliquid_trades_objects_arn = "arn:aws:s3:::hl-mainnet-node-data/*"
 
 aws.iam.RolePolicy(
@@ -214,9 +260,17 @@ aws.iam.RolePolicy(
                     },
                     {
                         "Effect": "Allow",
-                        "Action": ["s3:GetObject"],
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:GetObjectVersion",
+                            "s3:GetBucketLocation",
+                            "s3:GetBucketRequestPayment",
+                            "s3:ListBucket",
+                        ],
                         "Resource": [
+                            hyperliquid_archive_bucket_arn,
                             hyperliquid_archive_objects_arn,
+                            hyperliquid_trades_bucket_arn,
                             hyperliquid_trades_objects_arn,
                         ],
                     },
@@ -291,36 +345,9 @@ runtime_platform = aws.ecs.TaskDefinitionRuntimePlatformArgs(
     operating_system_family="LINUX",
 )
 
-backfill_task_definition = aws.ecs.TaskDefinition(
-    "backfill-task-definition",
-    family=f"{prefix}-backfill-{stack}",
-    cpu="512",
-    memory="1024",
-    network_mode="awsvpc",
-    requires_compatibilities=["FARGATE"],
-    execution_role_arn=execution_role.arn,
-    task_role_arn=task_role.arn,
-    runtime_platform=runtime_platform,
-    container_definitions=container_definitions(
-        image_name=image.image_name,
-        command=[
-            "python",
-            "-m",
-            "poochon_backtest_data.cli",
-            "backfill-day",
-            "--symbol",
-            proof_symbol,
-            "--date",
-            proof_date,
-        ],
-        env=base_env,
-        log_group_name=log_group.name,
-    ),
-)
-
-normalize_task_definition = aws.ecs.TaskDefinition(
-    "normalize-task-definition",
-    family=f"{prefix}-normalize-{stack}",
+ingest_task_definition = aws.ecs.TaskDefinition(
+    "ingest-task-definition",
+    family=f"{prefix}-ingest-{stack}",
     cpu="1024",
     memory="2048",
     network_mode="awsvpc",
@@ -334,18 +361,22 @@ normalize_task_definition = aws.ecs.TaskDefinition(
             "python",
             "-m",
             "poochon_backtest_data.cli",
-            "normalize-day",
-            "--symbol",
-            proof_symbol,
-            "--date",
-            proof_date,
+            "ingest-range",
+            "--market-type",
+            ingestion_market_type,
+            "--instrument",
+            ingestion_instrument,
+            "--start-date",
+            ingestion_start_date or "1970-01-01",
+            "--end-date",
+            ingestion_end_date or "1970-01-01",
         ],
         env=base_env,
         log_group_name=log_group.name,
     ),
 )
 
-materialize_task_definition_placeholder = aws.ecs.TaskDefinition(
+materialize_task_definition = aws.ecs.TaskDefinition(
     "materialize-task-definition",
     family=f"{prefix}-materialize-{stack}",
     cpu="1024",
@@ -362,10 +393,14 @@ materialize_task_definition_placeholder = aws.ecs.TaskDefinition(
             "-m",
             "poochon_backtest_data.cli",
             "materialize-replay",
-            "--symbol",
-            proof_symbol,
+            "--market-type",
+            ingestion_market_type,
+            "--instrument",
+            ingestion_instrument,
             "--date",
-            proof_date,
+            ingestion_start_date or "1970-01-01",
+            "--depth",
+            "20",
         ],
         env=base_env,
         log_group_name=log_group.name,
@@ -392,9 +427,8 @@ aws.iam.RolePolicy(
     role=step_role.id,
     policy=pulumi.Output.all(
         cluster.arn,
-        backfill_task_definition.arn,
-        normalize_task_definition.arn,
-        materialize_task_definition_placeholder.arn,
+        ingest_task_definition.arn,
+        materialize_task_definition.arn,
         execution_role.arn,
         task_role.arn,
     ).apply(
@@ -409,7 +443,7 @@ aws.iam.RolePolicy(
                             "ecs:StopTask",
                             "ecs:DescribeTasks",
                         ],
-                        "Resource": [args[1], args[2], args[3]],
+                        "Resource": [args[1], args[2]],
                     },
                     {
                         "Effect": "Allow",
@@ -419,7 +453,7 @@ aws.iam.RolePolicy(
                     {
                         "Effect": "Allow",
                         "Action": ["iam:PassRole"],
-                        "Resource": [args[4], args[5]],
+                        "Resource": [args[3], args[4]],
                     },
                     {
                         "Effect": "Allow",
@@ -466,21 +500,42 @@ def ecs_run_task_state(task_definition_arn: pulumi.Input[str], command_state: st
 
 
 ingestion_definition = pulumi.Output.all(
-    backfill=ecs_run_task_state(
-        backfill_task_definition.arn,
-        "States.Array('python','-m','poochon_backtest_data.cli','backfill-day','--symbol',$.symbol,'--date',$.date)",
+    explicit=ecs_run_task_state(
+        ingest_task_definition.arn,
+        "States.Array('python','-m','poochon_backtest_data.cli','ingest-range','--market-type',$.market_type,'--instrument',$.instrument,'--start-date',$.start_date,'--end-date',$.end_date)",
     ),
-    normalize=ecs_run_task_state(
-        normalize_task_definition.arn,
-        "States.Array('python','-m','poochon_backtest_data.cli','normalize-day','--symbol',$.symbol,'--date',$.date)",
+    relative=ecs_run_task_state(
+        ingest_task_definition.arn,
+        "States.Array('python','-m','poochon_backtest_data.cli','ingest-range','--market-type',$.market_type,'--instrument',$.instrument,'--start-offset-days',States.Format('{}',$.start_offset_days),'--end-offset-days',States.Format('{}',$.end_offset_days))",
     ),
 ).apply(
     lambda states: json.dumps(
         {
-            "StartAt": "BackfillDay",
+            "StartAt": "ResolveWindowMode",
             "States": {
-                "BackfillDay": {**states["backfill"], "Next": "NormalizeDay"},
-                "NormalizeDay": {**states["normalize"], "End": True},
+                "ResolveWindowMode": {
+                    "Type": "Choice",
+                    "Choices": [
+                        {
+                            "Variable": "$.start_date",
+                            "IsPresent": True,
+                            "Next": "IngestRangeExplicit",
+                        },
+                        {
+                            "Variable": "$.start_offset_days",
+                            "IsPresent": True,
+                            "Next": "IngestRangeRelative",
+                        },
+                    ],
+                    "Default": "MissingWindow",
+                },
+                "IngestRangeExplicit": {**states["explicit"], "End": True},
+                "IngestRangeRelative": {**states["relative"], "End": True},
+                "MissingWindow": {
+                    "Type": "Fail",
+                    "Error": "MissingWindow",
+                    "Cause": "Either start_date/end_date or start_offset_days/end_offset_days is required",
+                },
             },
         }
     )
@@ -493,10 +548,15 @@ ingestion_state_machine = aws.sfn.StateMachine(
 )
 
 materialize_definition = ecs_run_task_state(
-    materialize_task_definition_placeholder.arn,
-    "States.Array('python','-m','poochon_backtest_data.cli','materialize-replay','--symbol',$.symbol,'--date',$.date)",
+    materialize_task_definition.arn,
+    "States.Array('python','-m','poochon_backtest_data.cli','materialize-replay','--market-type',$.market_type,'--instrument',$.instrument,'--date',$.date,'--depth',States.Format('{}',$.depth))",
 ).apply(
-    lambda state: json.dumps({"StartAt": "MaterializeReplay", "States": {"MaterializeReplay": {**state, "End": True}}})
+    lambda state: json.dumps(
+        {
+            "StartAt": "MaterializeReplay",
+            "States": {"MaterializeReplay": {**state, "End": True}},
+        }
+    )
 )
 
 materialize_state_machine = aws.sfn.StateMachine(
@@ -567,17 +627,31 @@ aws.iam.RolePolicy(
     ),
 )
 
-bootstrap_schedule = aws.scheduler.Schedule(
-    "bootstrap-ingestion-schedule",
-    schedule_expression=f"at({bootstrap_at})",
-    flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
-    target=aws.scheduler.ScheduleTargetArgs(
-        arn=ingestion_state_machine.arn,
-        role_arn=scheduler_role.arn,
-        input=json.dumps({"symbol": proof_symbol, "date": proof_date}),
-    ),
-    schedule_expression_timezone="UTC",
-)
+ingestion_schedule = None
+if ingestion_mode == "once":
+    ingestion_schedule = aws.scheduler.Schedule(
+        "ingestion-schedule",
+        schedule_expression=f"at({ingestion_start_at})",
+        flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
+        target=aws.scheduler.ScheduleTargetArgs(
+            arn=ingestion_state_machine.arn,
+            role_arn=scheduler_role.arn,
+            input=json.dumps(ingestion_input),
+        ),
+        schedule_expression_timezone="UTC",
+    )
+elif ingestion_mode == "cron":
+    ingestion_schedule = aws.scheduler.Schedule(
+        "ingestion-schedule",
+        schedule_expression=cron_expression,
+        flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
+        target=aws.scheduler.ScheduleTargetArgs(
+            arn=ingestion_state_machine.arn,
+            role_arn=scheduler_role.arn,
+            input=json.dumps(ingestion_input),
+        ),
+        schedule_expression_timezone="UTC",
+    )
 
 alb = aws.lb.LoadBalancer(
     "runtime-alb",
@@ -640,4 +714,9 @@ pulumi.export("cluster_arn", cluster.arn)
 pulumi.export("api_url", alb.dns_name.apply(lambda dns: f"http://{dns}"))
 pulumi.export("ingestion_state_machine_arn", ingestion_state_machine.arn)
 pulumi.export("materialize_state_machine_arn", materialize_state_machine.arn)
-pulumi.export("bootstrap_schedule_name", bootstrap_schedule.name)
+pulumi.export(
+    "ingestion_schedule_name",
+    pulumi.Output.from_input(None)
+    if ingestion_schedule is None
+    else ingestion_schedule.name,
+)

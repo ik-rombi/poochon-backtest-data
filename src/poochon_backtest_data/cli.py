@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 import logging
 
-import boto3
 import uvicorn
 
 from .api import create_app
-from .hyperliquid import backfill_day, normalize_day
-from .models import ReplayRequest
+from .hyperliquid import backfill_day, ingest_range, normalize_day
+from .models import IngestionRequest, MarketRef, MarketType, ReplayRequest
 from .service import materialize_replay
 from .settings import get_settings
 from .storage import CoverageRepository, ReplayRepository, S3Store, boto3_session
@@ -34,23 +33,43 @@ def _session_bundle():
     )
 
 
+def _add_market_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--market-type", choices=[item.value for item in MarketType], required=True)
+    parser.add_argument("--instrument", required=True)
+
+
+def _market_ref_from_args(args: argparse.Namespace) -> MarketRef:
+    return MarketRef(
+        market_type=args.market_type,
+        instrument=args.instrument,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="poochon-backtest-data")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("api")
 
+    ingest_parser = subparsers.add_parser("ingest-range")
+    _add_market_args(ingest_parser)
+    ingest_parser.add_argument("--start-date")
+    ingest_parser.add_argument("--end-date")
+    ingest_parser.add_argument("--start-offset-days", type=int)
+    ingest_parser.add_argument("--end-offset-days", type=int)
+
     backfill_parser = subparsers.add_parser("backfill-day")
-    backfill_parser.add_argument("--symbol", required=True)
+    _add_market_args(backfill_parser)
     backfill_parser.add_argument("--date", required=True)
 
     normalize_parser = subparsers.add_parser("normalize-day")
-    normalize_parser.add_argument("--symbol", required=True)
+    _add_market_args(normalize_parser)
     normalize_parser.add_argument("--date", required=True)
 
     materialize_parser = subparsers.add_parser("materialize-replay")
-    materialize_parser.add_argument("--symbol", required=True)
+    _add_market_args(materialize_parser)
     materialize_parser.add_argument("--date", required=True)
+    materialize_parser.add_argument("--depth", type=int, default=20)
 
     args = parser.parse_args()
     settings = get_settings()
@@ -66,23 +85,45 @@ def main() -> None:
         return
 
     settings, s3_store, coverage_repo, replay_repo = _session_bundle()
+    if args.command == "ingest-range":
+        ingest_range(
+            s3_store,
+            coverage_repo,
+            request=IngestionRequest(
+                market_type=args.market_type,
+                instrument=args.instrument,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                start_offset_days=args.start_offset_days,
+                end_offset_days=args.end_offset_days,
+            ),
+            request_payer=settings.request_payer,
+        )
+        return
+
+    market = _market_ref_from_args(args)
     if args.command == "backfill-day":
         backfill_day(
             s3_store,
             coverage_repo,
-            symbol=args.symbol,
+            market=market,
             date=args.date,
             request_payer=settings.request_payer,
         )
         return
 
     if args.command == "normalize-day":
-        normalize_day(s3_store, coverage_repo, symbol=args.symbol, date=args.date)
+        normalize_day(s3_store, coverage_repo, market=market, date=args.date)
         return
 
     if args.command == "materialize-replay":
         materialize_replay(
-            request=ReplayRequest(symbol=args.symbol, date=args.date),
+            request=ReplayRequest(
+                market_type=args.market_type,
+                instrument=args.instrument,
+                date=args.date,
+                depth=args.depth,
+            ),
             s3_store=s3_store,
             coverage_repo=coverage_repo,
             replay_repo=replay_repo,

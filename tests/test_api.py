@@ -9,7 +9,9 @@ from poochon_backtest_data.settings import Settings
 
 class FakeReplayService:
     def __init__(self):
-        self.record = new_pending_replay(ReplayRequest(symbol="BTC", date="2025-05-24"))
+        self.record = new_pending_replay(
+            ReplayRequest(market_type="perp", instrument="BTC", date="2025-05-24")
+        )
 
     def submit_replay(self, request: ReplayRequest):
         return self.record
@@ -31,7 +33,7 @@ def test_api_returns_202_for_pending_replay() -> None:
     client = TestClient(create_app(Settings(), replay_service=FakeReplayService()))
     response = client.post(
         "/api/v1/replays",
-        json={"symbol": "BTC", "date": "2025-05-24"},
+        json={"market_type": "perp", "instrument": "BTC", "date": "2025-05-24"},
     )
     assert response.status_code == 202
 

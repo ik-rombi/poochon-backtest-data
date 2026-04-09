@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import io
 import time
 from typing import Any
 
-import boto3
 import orjson
 import pyarrow.parquet as pq
 import zstandard
@@ -13,6 +11,7 @@ import zstandard
 from .models import (
     CoverageStatus,
     DatasetKind,
+    MarketRef,
     ReplayRecord,
     ReplayRequest,
     ReplayStatus,
@@ -44,7 +43,7 @@ class ReplayService:
         self.replay_state_machine_arn = replay_state_machine_arn
 
     def submit_replay(self, request: ReplayRequest) -> ReplayRecord:
-        self._assert_coverage_ready(request.symbol, request.date)
+        self._assert_coverage_ready(request.market_ref(), request.date)
         replay_id = request.replay_id()
         existing = self.replay_repo.get(replay_id)
         if existing is not None:
@@ -56,10 +55,10 @@ class ReplayService:
             self._start_materialize_workflow(record.request)
         return record
 
-    def _assert_coverage_ready(self, symbol: str, date: str) -> None:
+    def _assert_coverage_ready(self, market: MarketRef, date: str) -> None:
         needed = [
-            coverage_pk(DatasetKind.NORMALIZED_L2, symbol, date, "daily"),
-            coverage_pk(DatasetKind.NORMALIZED_TRADES, symbol, date, "daily"),
+            coverage_pk(DatasetKind.NORMALIZED_L2, market, date, "daily"),
+            coverage_pk(DatasetKind.NORMALIZED_TRADES, market, date, "daily"),
         ]
         for item in needed:
             record = self.coverage_repo.get(item)
@@ -92,7 +91,7 @@ def _trade_event(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "Market": {
             "Trade": {
-                "instrument": {"venue": "Hyperliquid", "symbol": row["symbol"]},
+                "instrument": {"venue": "Hyperliquid", "symbol": row["instrument"]},
                 "ts_ms": row["ts_ms"],
                 "px": row["px"],
                 "sz": row["sz"],
@@ -102,10 +101,10 @@ def _trade_event(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _snapshot_event(row: dict[str, Any]) -> dict[str, Any]:
+def _snapshot_event(row: dict[str, Any], *, depth: int) -> dict[str, Any]:
     def decode_levels(raw_levels: str) -> list[dict[str, Any]]:
         levels = []
-        for level in orjson.loads(raw_levels):
+        for level in orjson.loads(raw_levels)[:depth]:
             levels.append(
                 {
                     "px": float(level["px"]),
@@ -118,7 +117,7 @@ def _snapshot_event(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "Market": {
             "L2Snapshot": {
-                "instrument": {"venue": "Hyperliquid", "symbol": row["symbol"]},
+                "instrument": {"venue": "Hyperliquid", "symbol": row["instrument"]},
                 "ts_ms": row["ts_ms"],
                 "bids": decode_levels(row["bids_json"]),
                 "asks": decode_levels(row["asks_json"]),
@@ -148,17 +147,23 @@ def materialize_replay(
         coverage_repo=coverage_repo,
         replay_repo=replay_repo,
     )
-    service._assert_coverage_ready(request.symbol, request.date)
+    service._assert_coverage_ready(request.market_ref(), request.date)
 
-    record = replay_repo.get(request.replay_id()) or new_pending_replay(request)
+    existing = replay_repo.get(request.replay_id())
+    if existing is not None and existing.status == ReplayStatus.READY and s3_store.exists(existing.replay_s3_key):
+        return existing
+
+    record = existing or new_pending_replay(request)
     temp_path = f"/tmp/{request.replay_id()}.jsonl.zst"
     event_count = 0
 
     with open(temp_path, "wb") as raw_file:
         with zstandard.ZstdCompressor(level=3).stream_writer(raw_file) as writer:
             for hour in range(24):
-                l2_bytes = s3_store.get_bytes(normalized_l2_s3_key(request.symbol, request.date, hour))
-                trade_bytes = s3_store.get_bytes(normalized_trade_s3_key(request.symbol, request.date, hour))
+                l2_bytes = s3_store.get_bytes(normalized_l2_s3_key(request.market_ref(), request.date, hour))
+                trade_bytes = s3_store.get_bytes(
+                    normalized_trade_s3_key(request.market_ref(), request.date, hour)
+                )
                 l2_rows = pq.read_table(io.BytesIO(l2_bytes)).to_pylist()
                 trade_rows = pq.read_table(io.BytesIO(trade_bytes)).to_pylist()
                 l2_index = 0
@@ -174,7 +179,7 @@ def materialize_replay(
                         writer.write(b"\n")
                         trade_index += 1
                     else:
-                        writer.write(orjson.dumps(_snapshot_event(next_l2)))
+                        writer.write(orjson.dumps(_snapshot_event(next_l2, depth=request.depth)))
                         writer.write(b"\n")
                         l2_index += 1
                     event_count += 1
