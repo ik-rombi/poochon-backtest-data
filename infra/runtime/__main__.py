@@ -159,12 +159,12 @@ ecr_auth = aws.ecr.get_authorization_token_output()
 image = docker.Image(
     "app-image",
     image_name=ecr_repo.repository_url.apply(lambda url: f"{url}:latest"),
-    build=docker.DockerBuild(
+    build=docker.DockerBuildArgs(
         context=str((Path(__file__).parent / "../..").resolve()),
         dockerfile=str((Path(__file__).parent / "../../Dockerfile").resolve()),
         platform="linux/arm64",
     ),
-    registry=docker.Registry(
+    registry=docker.RegistryArgs(
         server=ecr_repo.repository_url.apply(lambda url: url.split("/")[0]),
         username=ecr_auth.user_name,
         password=ecr_auth.password,

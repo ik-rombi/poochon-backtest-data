@@ -90,3 +90,7 @@ def main() -> None:
         return
 
     raise RuntimeError(f"unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
