@@ -6,19 +6,18 @@ import logging
 import uvicorn
 
 from .api import create_app
-from .hyperliquid import backfill_day, ingest_range, normalize_day
+from .hyperliquid import sync_window
 from .models import (
     IngestionRequest,
-    MarketRef,
     MarketType,
-    PolymarketReplayCreateRequest,
-    ReplayRequest,
-    Venue,
+    OutcomesMode,
+    PolymarketSeriesSyncRequest,
+    iter_dates_inclusive,
 )
-from .polymarket_telonex import ingest_market, resolve_market
-from .service import materialize_replay
+from .polymarket_telonex import sync_series
+from .canonical import build_polymarket_canonical_day_from_storage
 from .settings import get_settings
-from .storage import CoverageRepository, ReplayRepository, S3Store, boto3_session
+from .storage import CanonicalShardRepository, CoverageRepository, S3Store, boto3_session
 
 
 def _configure_logging(level: str) -> None:
@@ -26,30 +25,20 @@ def _configure_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _session_bundle():
     settings = get_settings()
-    if not settings.data_bucket or not settings.coverage_table_name or not settings.replay_table_name:
-        raise RuntimeError("required AWS settings are missing")
+    if not settings.data_bucket or not settings.coverage_table_name or not settings.shard_table_name:
+        raise RuntimeError("POOCHON_DATA_BUCKET, POOCHON_COVERAGE_TABLE_NAME, and POOCHON_SHARD_TABLE_NAME are required")
     session = boto3_session(settings.aws_region)
     return (
         settings,
         S3Store(session, settings.data_bucket),
         CoverageRepository(session, settings.coverage_table_name),
-        ReplayRepository(session, settings.replay_table_name),
-    )
-
-
-def _add_market_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--market-type", choices=[item.value for item in MarketType], required=True)
-    parser.add_argument("--instrument", required=True)
-
-
-def _market_ref_from_args(args: argparse.Namespace) -> MarketRef:
-    return MarketRef(
-        market_type=args.market_type,
-        instrument=args.instrument,
+        CanonicalShardRepository(session, settings.shard_table_name),
     )
 
 
@@ -66,34 +55,38 @@ def main() -> None:
 
     subparsers.add_parser("api")
 
-    ingest_parser = subparsers.add_parser("ingest-range")
-    _add_market_args(ingest_parser)
-    ingest_parser.add_argument("--start-date")
-    ingest_parser.add_argument("--end-date")
-    ingest_parser.add_argument("--start-offset-days", type=int)
-    ingest_parser.add_argument("--end-offset-days", type=int)
+    hyperliquid_sync_parser = subparsers.add_parser("hyperliquid-sync-window")
+    hyperliquid_sync_parser.add_argument(
+        "--market-type", choices=[MarketType.PERP.value, MarketType.SPOT.value], required=True
+    )
+    hyperliquid_sync_parser.add_argument("--instrument", required=True)
+    hyperliquid_sync_parser.add_argument("--start-date")
+    hyperliquid_sync_parser.add_argument("--end-date")
+    hyperliquid_sync_parser.add_argument("--start-offset-days", type=int)
+    hyperliquid_sync_parser.add_argument("--end-offset-days", type=int)
+    hyperliquid_sync_parser.add_argument("--depth", type=int, default=20)
 
-    backfill_parser = subparsers.add_parser("backfill-day")
-    _add_market_args(backfill_parser)
-    backfill_parser.add_argument("--date", required=True)
+    polymarket_sync_parser = subparsers.add_parser("polymarket-sync-series")
+    polymarket_sync_parser.add_argument("--series", required=True)
+    polymarket_sync_parser.add_argument("--start-date", required=True)
+    polymarket_sync_parser.add_argument("--end-date", required=True)
+    polymarket_sync_parser.add_argument(
+        "--outcomes",
+        choices=[item.value for item in OutcomesMode],
+        default=OutcomesMode.BOTH.value,
+    )
+    polymarket_sync_parser.add_argument("--depth", type=int, default=5)
 
-    normalize_parser = subparsers.add_parser("normalize-day")
-    _add_market_args(normalize_parser)
-    normalize_parser.add_argument("--date", required=True)
-
-    materialize_parser = subparsers.add_parser("materialize-replay")
-    _add_market_args(materialize_parser)
-    materialize_parser.add_argument("--date", required=True)
-    materialize_parser.add_argument("--depth", type=int, default=20)
-
-    polymarket_ingest_parser = subparsers.add_parser("polymarket-ingest-market")
-    polymarket_ingest_parser.add_argument("--slug", required=True)
-    polymarket_ingest_parser.add_argument("--outcome", required=True)
-
-    polymarket_materialize_parser = subparsers.add_parser("polymarket-materialize-replay")
-    polymarket_materialize_parser.add_argument("--slug", required=True)
-    polymarket_materialize_parser.add_argument("--outcome", required=True)
-    polymarket_materialize_parser.add_argument("--depth", type=int, default=5)
+    polymarket_build_parser = subparsers.add_parser("polymarket-build-canonical-window")
+    polymarket_build_parser.add_argument("--series", required=True)
+    polymarket_build_parser.add_argument("--start-date", required=True)
+    polymarket_build_parser.add_argument("--end-date", required=True)
+    polymarket_build_parser.add_argument(
+        "--outcomes",
+        choices=[item.value for item in OutcomesMode],
+        default=OutcomesMode.BOTH.value,
+    )
+    polymarket_build_parser.add_argument("--depth", type=int, default=5)
 
     args = parser.parse_args()
     settings = get_settings()
@@ -108,11 +101,12 @@ def main() -> None:
         )
         return
 
-    settings, s3_store, coverage_repo, replay_repo = _session_bundle()
-    if args.command == "ingest-range":
-        ingest_range(
+    settings, s3_store, coverage_repo, shard_repo = _session_bundle()
+    if args.command == "hyperliquid-sync-window":
+        sync_window(
             s3_store,
             coverage_repo,
+            shard_repo,
             request=IngestionRequest(
                 market_type=args.market_type,
                 instrument=args.instrument,
@@ -122,74 +116,36 @@ def main() -> None:
                 end_offset_days=args.end_offset_days,
             ),
             request_payer=settings.request_payer,
+            depth=args.depth,
         )
         return
 
-    if args.command == "backfill-day":
-        market = _market_ref_from_args(args)
-        backfill_day(
+    if args.command == "polymarket-sync-series":
+        sync_series(
             s3_store,
             coverage_repo,
-            market=market,
-            date=args.date,
-            request_payer=settings.request_payer,
-        )
-        return
-
-    if args.command == "normalize-day":
-        market = _market_ref_from_args(args)
-        normalize_day(s3_store, coverage_repo, market=market, date=args.date)
-        return
-
-    if args.command == "materialize-replay":
-        materialize_replay(
-            request=ReplayRequest(
-                market_type=args.market_type,
-                instrument=args.instrument,
-                date=args.date,
+            shard_repo,
+            request=PolymarketSeriesSyncRequest(
+                series=args.series,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                outcomes=args.outcomes,
                 depth=args.depth,
             ),
-            s3_store=s3_store,
-            coverage_repo=coverage_repo,
-            replay_repo=replay_repo,
-        )
-        return
-
-    if args.command == "polymarket-ingest-market":
-        ingest_market(
-            s3_store,
-            coverage_repo,
-            request=PolymarketReplayCreateRequest(slug=args.slug, outcome=args.outcome),
             telonex_api_key=_require_telonex_api_key(),
         )
         return
 
-    if args.command == "polymarket-materialize-replay":
-        resolution = resolve_market(
-            PolymarketReplayCreateRequest(
-                slug=args.slug,
-                outcome=args.outcome,
+    if args.command == "polymarket-build-canonical-window":
+        for date in iter_dates_inclusive(args.start_date, args.end_date):
+            build_polymarket_canonical_day_from_storage(
+                date=date,
+                series_key=args.series,
+                outcomes=OutcomesMode(args.outcomes),
                 depth=args.depth,
+                s3_store=s3_store,
+                shard_repo=shard_repo,
             )
-        )
-        materialize_replay(
-            request=ReplayRequest(
-                venue=Venue.POLYMARKET,
-                market_type=MarketType.BINARY,
-                instrument=resolution.instrument,
-                depth=args.depth,
-                slug=resolution.slug,
-                outcome=resolution.outcome,
-                market_id=resolution.market_id,
-                asset_id=resolution.asset_id,
-                dates=resolution.dates,
-                start_ts_ms=resolution.start_ts_ms,
-                end_ts_ms=resolution.end_ts_ms,
-            ),
-            s3_store=s3_store,
-            coverage_repo=coverage_repo,
-            replay_repo=replay_repo,
-        )
         return
 
     raise RuntimeError(f"unsupported command: {args.command}")

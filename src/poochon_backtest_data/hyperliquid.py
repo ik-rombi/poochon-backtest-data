@@ -3,13 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import io
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import lz4.frame
 import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .canonical import build_hyperliquid_canonical_day
 from .models import (
     CoverageRecord,
     CoverageStatus,
@@ -21,11 +22,12 @@ from .models import (
     coverage_pk,
     normalized_l2_s3_key,
     normalized_trade_s3_key,
+    raw_fill_s3_key,
     raw_l2_s3_key,
     raw_trade_s3_key,
     utc_now_iso,
 )
-from .storage import CoverageRepository, S3Store
+from .storage import CanonicalShardRepository, CoverageRepository, S3Store
 
 L2_SOURCE_BUCKET = "hyperliquid-archive"
 TRADE_SOURCE_BUCKET = "hl-mainnet-node-data"
@@ -40,7 +42,7 @@ def l2_source_key(market: MarketRef, date: str, hour: int) -> str:
 
 
 def trade_source_key(date: str, hour: int) -> str:
-    return f"node_trades/hourly/{source_date(date)}/{hour}.lz4"
+    return f"node_fills_by_block/hourly/{source_date(date)}/{hour}.lz4"
 
 
 def requester_pays_copy(
@@ -64,7 +66,7 @@ def requester_pays_copy(
     return len(payload)
 
 
-def iter_lz4_json_lines(payload: bytes) -> Iterator[tuple[int, dict]]:
+def iter_lz4_json_lines(payload: bytes) -> Iterator[tuple[int, dict[str, Any]]]:
     with lz4.frame.open(io.BytesIO(payload), mode="rb") as reader:
         for line_number, raw_line in enumerate(reader, start=1):
             stripped = raw_line.strip()
@@ -87,7 +89,7 @@ def iso_to_epoch_ms(value: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def parse_l2_snapshot(line: dict, *, source_hour: int, source_line_number: int) -> NormalizedL2Snapshot:
+def parse_l2_snapshot(line: dict[str, Any], *, source_hour: int, source_line_number: int) -> NormalizedL2Snapshot:
     data = line["raw"]["data"]
     return NormalizedL2Snapshot(
         ts_ms=int(data["time"]),
@@ -99,25 +101,92 @@ def parse_l2_snapshot(line: dict, *, source_hour: int, source_line_number: int) 
     )
 
 
+def _fill_group_key(fill: dict[str, Any]) -> tuple[str, int, int, str, str, str]:
+    return (
+        str(fill["coin"]),
+        int(fill["time"]),
+        int(fill["tid"]),
+        str(fill.get("hash", "")),
+        str(fill["px"]),
+        str(fill["sz"]),
+    )
+
+
+def _select_canonical_fill(group: list[dict[str, Any]]) -> dict[str, Any]:
+    crossed = [candidate for candidate in group if candidate["crossed"]]
+    candidates = crossed or group
+    return min(candidates, key=lambda item: (item["addr"], int(item["oid"])))
+
+
 def parse_trade(
-    line: dict,
+    line: dict[str, Any],
     *,
     instrument: str,
     source_hour: int,
     source_line_number: int,
 ) -> NormalizedTrade | None:
-    if line["coin"] != instrument:
+    fill = line.get("fill", line)
+    if fill.get("coin") != instrument:
+        return None
+    if int(fill.get("tid", 0)) == 0:
+        return None
+    if fill.get("dir") == "Spot Dust Conversion":
+        return None
+    side = str(fill["side"])
+    if side not in {"A", "B"}:
         return None
     return NormalizedTrade(
-        ts_ms=iso_to_epoch_ms(line["time"]),
-        instrument=line["coin"],
-        side="Buy" if line["side"] == "B" else "Sell",
-        px=float(line["px"]),
-        sz=float(line["sz"]),
-        hash=line["hash"],
+        ts_ms=int(fill["time"]),
+        instrument=instrument,
+        side="Buy" if side == "B" else "Sell",
+        px=float(fill["px"]),
+        sz=float(fill["sz"]),
+        hash=str(fill.get("hash", "")),
         source_hour=source_hour,
         source_line_number=source_line_number,
     )
+
+
+def collapse_fill_trades(
+    payload: bytes,
+    *,
+    instrument: str,
+    source_hour: int,
+) -> list[NormalizedTrade]:
+    grouped: dict[tuple[str, int, int, str, str, str], list[dict[str, Any]]] = {}
+    for line_number, raw_line in iter_lz4_json_lines(payload):
+        for event_index, event in enumerate(raw_line.get("events") or [], start=1):
+            if not isinstance(event, list | tuple) or len(event) != 2:
+                continue
+            addr, fill = event
+            candidate = {
+                "addr": str(addr),
+                "oid": int(fill.get("oid", 0)),
+                "crossed": bool(fill.get("crossed")),
+                "fill": fill,
+                "source_line_number": line_number * 10000 + event_index,
+            }
+            if fill.get("coin") != instrument:
+                continue
+            if int(fill.get("tid", 0)) == 0:
+                continue
+            if fill.get("dir") == "Spot Dust Conversion":
+                continue
+            grouped.setdefault(_fill_group_key(fill), []).append(candidate)
+
+    rows: list[NormalizedTrade] = []
+    for group in grouped.values():
+        canonical = _select_canonical_fill(group)
+        parsed = parse_trade(
+            canonical["fill"],
+            instrument=instrument,
+            source_hour=source_hour,
+            source_line_number=min(item["source_line_number"] for item in group),
+        )
+        if parsed is not None:
+            rows.append(parsed)
+    rows.sort(key=lambda item: (item.ts_ms, item.source_line_number))
+    return rows
 
 
 def _coverage_ready(
@@ -177,7 +246,7 @@ def backfill_day(
     request_payer: str = "requester",
 ) -> None:
     l2_keys = [raw_l2_s3_key(market, date, hour) for hour in range(24)]
-    trade_keys = [raw_trade_s3_key(market, date, hour) for hour in range(24)]
+    trade_keys = [raw_fill_s3_key(market, date, hour) for hour in range(24)]
     if (
         _coverage_ready(coverage, DatasetKind.RAW_L2, market, date, "daily")
         and _coverage_ready(coverage, DatasetKind.RAW_TRADES, market, date, "daily")
@@ -191,7 +260,7 @@ def backfill_day(
         l2_hour = _coverage_ready(coverage, DatasetKind.RAW_L2, market, date, f"{hour:02d}")
         trade_hour = _coverage_ready(coverage, DatasetKind.RAW_TRADES, market, date, f"{hour:02d}")
         l2_key = raw_l2_s3_key(market, date, hour)
-        trade_key = raw_trade_s3_key(market, date, hour)
+        trade_key = raw_fill_s3_key(market, date, hour)
 
         if l2_hour and destination.exists(l2_key):
             copied_l2 = l2_hour.byte_count
@@ -264,7 +333,7 @@ def backfill_day(
     )
 
 
-def _write_parquet(rows: list[dict], schema: pa.Schema, path: Path) -> None:
+def _write_parquet(rows: list[dict[str, Any]], schema: pa.Schema, path: Path) -> None:
     table = pa.Table.from_pylist(rows, schema=schema)
     pq.write_table(table, path, compression="zstd")
 
@@ -322,10 +391,9 @@ def normalize_day(destination: S3Store, coverage: CoverageRepository, *, market:
             total_trade_bytes += trade_hour.byte_count
             continue
 
-        l2_rows: list[dict] = []
-        trade_rows: list[dict] = []
+        l2_rows: list[dict[str, Any]] = []
         l2_payload = destination.get_bytes(raw_l2_s3_key(market, date, hour))
-        trade_payload = destination.get_bytes(raw_trade_s3_key(market, date, hour))
+        fill_payload = destination.get_bytes(raw_trade_s3_key(market, date, hour))
         for line_number, raw_line in iter_lz4_json_lines(l2_payload):
             snapshot = parse_l2_snapshot(
                 raw_line,
@@ -333,16 +401,8 @@ def normalize_day(destination: S3Store, coverage: CoverageRepository, *, market:
                 source_line_number=line_number,
             )
             l2_rows.append(snapshot.__dict__)
-        for line_number, raw_line in iter_lz4_json_lines(trade_payload):
-            trade = parse_trade(
-                raw_line,
-                instrument=market.instrument,
-                source_hour=hour,
-                source_line_number=line_number,
-            )
-            if trade is None:
-                continue
-            trade_rows.append(trade.__dict__)
+        l2_rows.sort(key=lambda item: (int(item["ts_ms"]), int(item["source_line_number"])))
+        trade_rows = [row.__dict__ for row in collapse_fill_trades(fill_payload, instrument=market.instrument, source_hour=hour)]
 
         l2_path = tmp_dir / f"{instrument_slug}-{date}-{hour:02d}-l2.parquet"
         trade_path = tmp_dir / f"{instrument_slug}-{date}-{hour:02d}-trade.parquet"
@@ -402,12 +462,14 @@ def normalize_day(destination: S3Store, coverage: CoverageRepository, *, market:
     )
 
 
-def ingest_range(
+def sync_window(
     destination: S3Store,
     coverage: CoverageRepository,
+    shard_repo: CanonicalShardRepository,
     *,
     request: IngestionRequest,
     request_payer: str = "requester",
+    depth: int = 20,
 ) -> None:
     market = request.day_request(request.resolve_window()[0])
     for date in request.iter_dates():
@@ -424,3 +486,21 @@ def ingest_range(
             market=market,
             date=date,
         )
+        build_hyperliquid_canonical_day(
+            market=market,
+            date=date,
+            depth=depth,
+            s3_store=destination,
+            coverage_repo=coverage,
+            shard_repo=shard_repo,
+        )
+
+
+def ingest_range(
+    destination: S3Store,
+    coverage: CoverageRepository,
+    *,
+    request: IngestionRequest,
+    request_payer: str = "requester",
+) -> None:
+    raise RuntimeError("ingest-range is deprecated; use hyperliquid-sync-window instead")

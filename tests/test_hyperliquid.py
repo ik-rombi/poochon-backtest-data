@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 import io
 from pathlib import Path
 
@@ -8,89 +7,41 @@ import lz4.frame
 import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
+import zstandard
 
-from poochon_backtest_data.hyperliquid import (
-    backfill_day,
-    iso_to_epoch_ms,
-    l2_source_key,
-    normalize_day,
-    parse_l2_snapshot,
-    parse_trade,
-    trade_source_key,
-)
+from poochon_backtest_data.canonical import build_hyperliquid_canonical_day
+from poochon_backtest_data.hyperliquid import collapse_fill_trades, trade_source_key
 from poochon_backtest_data.models import (
+    CanonicalShardRecord,
     CoverageRecord,
     CoverageStatus,
     DatasetKind,
-    IngestionRequest,
     MarketRef,
     coverage_pk,
     normalized_l2_s3_key,
     normalized_trade_s3_key,
-    raw_l2_s3_key,
-    raw_trade_s3_key,
     utc_now_iso,
 )
 
 
-class FakeBody:
-    def __init__(self, data: bytes):
-        self._data = data
-
-    def read(self) -> bytes:
-        return self._data
-
-
-class FakeS3Client:
-    def __init__(self):
-        self.objects: dict[tuple[str, str], bytes] = {}
-        self.get_requests: list[tuple[str, str]] = []
-
-    def head_object(self, *, Bucket: str, Key: str):
-        payload = self.objects.get((Bucket, Key))
-        if payload is None:
-            raise RuntimeError("missing object")
-        return {"ContentLength": len(payload)}
-
-    def get_object(self, *, Bucket: str, Key: str, RequestPayer: str | None = None):
-        self.get_requests.append((Bucket, Key))
-        payload = self.objects[(Bucket, Key)]
-        return {"Body": FakeBody(payload)}
-
-
 class FakeS3Store:
     def __init__(self):
-        self.bucket = "test-bucket"
-        self.client = FakeS3Client()
         self.objects: dict[str, bytes] = {}
-        self.get_bytes_calls = 0
 
-    def put_bytes(
-        self,
-        key: str,
-        data: bytes,
-        *,
-        content_type: str | None = None,
-        content_encoding: str | None = None,
-    ) -> None:
+    def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None, content_encoding: str | None = None) -> None:
         self.objects[key] = data
-        self.client.objects[(self.bucket, key)] = data
 
     def put_file(self, key: str, path: str, *, content_type: str | None = None) -> None:
-        data = Path(path).read_bytes()
-        self.objects[key] = data
-        self.client.objects[(self.bucket, key)] = data
+        self.objects[key] = Path(path).read_bytes()
+
+    def put_json(self, key: str, payload: dict) -> None:
+        self.objects[key] = orjson.dumps(payload)
 
     def get_bytes(self, key: str) -> bytes:
-        self.get_bytes_calls += 1
         return self.objects[key]
 
     def exists(self, key: str) -> bool:
         return key in self.objects
-
-    def object_size(self, key: str) -> int | None:
-        payload = self.objects.get(key)
-        return None if payload is None else len(payload)
 
 
 class FakeCoverageRepository:
@@ -104,30 +55,15 @@ class FakeCoverageRepository:
         self.items[record.pk] = record
 
 
-def ready_coverage(
-    dataset_kind: DatasetKind,
-    market: MarketRef,
-    date: str,
-    hour: str,
-    *,
-    byte_count: int,
-    row_count: int = 0,
-) -> CoverageRecord:
-    return CoverageRecord(
-        pk=coverage_pk(dataset_kind, market, date, hour),
-        dataset_kind=dataset_kind,
-        venue=market.venue,
-        market_type=market.market_type,
-        instrument=market.instrument,
-        date=date,
-        hour=hour,
-        status=CoverageStatus.READY,
-        object_count=1 if hour != "daily" else 24,
-        byte_count=byte_count,
-        row_count=row_count,
-        updated_at=utc_now_iso(),
-        source="test",
-    )
+class FakeShardRepository:
+    def __init__(self):
+        self.items: dict[str, CanonicalShardRecord] = {}
+
+    def get(self, shard_id: str):
+        return self.items.get(shard_id)
+
+    def put(self, record: CanonicalShardRecord) -> None:
+        self.items[record.shard_id] = record
 
 
 def lz4_bytes(lines: list[dict]) -> bytes:
@@ -142,113 +78,178 @@ def parquet_bytes(rows: list[dict], schema: pa.Schema) -> bytes:
     return buffer.getvalue()
 
 
-def test_iso_to_epoch_ms_handles_nanoseconds() -> None:
-    assert iso_to_epoch_ms("2025-03-31T23:59:59.962208772") == 1743465599962
+def ready_coverage(dataset_kind: DatasetKind, market: MarketRef, date: str) -> CoverageRecord:
+    return CoverageRecord(
+        pk=coverage_pk(dataset_kind, market, date, "daily"),
+        dataset_kind=dataset_kind,
+        venue=market.venue,
+        market_type=market.market_type,
+        instrument=market.instrument,
+        date=date,
+        hour="daily",
+        status=CoverageStatus.READY,
+        object_count=24,
+        byte_count=1,
+        row_count=1,
+        updated_at=utc_now_iso(),
+        source="test",
+    )
 
 
-def test_parse_trade_filters_non_target_instrument() -> None:
-    raw = {
-        "coin": "DOGE",
-        "side": "B",
-        "time": "2025-03-31T23:59:59.962208772",
-        "px": "0.16656",
-        "sz": "600.0",
-        "hash": "0xabc",
-    }
-    assert parse_trade(raw, instrument="BTC", source_hour=0, source_line_number=1) is None
+def test_trade_source_key_uses_node_fills_by_block() -> None:
+    assert trade_source_key("2026-02-19", 0) == "node_fills_by_block/hourly/20260219/0.lz4"
 
 
-def test_parse_l2_snapshot_keeps_book_payload_for_materialization() -> None:
-    raw = {
-        "raw": {
-            "data": {
-                "coin": "BTC",
-                "time": 1705309199653,
-                "levels": [
-                    [{"px": "42706.0", "sz": "0.02342", "n": 1}],
-                    [{"px": "42707.0", "sz": "0.09689", "n": 3}],
-                ],
+def test_collapse_fill_trades_uses_crossed_fill_side_and_skips_non_trade_rows() -> None:
+    payload = lz4_bytes(
+        [
+            {
+                "events": [
+                    [
+                        "0xbuyer",
+                        {
+                            "coin": "BTC",
+                            "px": "66436.0",
+                            "sz": "0.00017",
+                            "side": "B",
+                            "time": 1771459202061,
+                            "hash": "0x0",
+                            "oid": 1,
+                            "crossed": False,
+                            "tid": 7,
+                            "dir": "Close Short",
+                        },
+                    ],
+                    [
+                        "0xseller",
+                        {
+                            "coin": "BTC",
+                            "px": "66436.0",
+                            "sz": "0.00017",
+                            "side": "A",
+                            "time": 1771459202061,
+                            "hash": "0x0",
+                            "oid": 2,
+                            "crossed": True,
+                            "tid": 7,
+                            "dir": "Open Short",
+                        },
+                    ],
+                    [
+                        "0xdust",
+                        {
+                            "coin": "BTC",
+                            "px": "1.0",
+                            "sz": "1.0",
+                            "side": "B",
+                            "time": 1771459202061,
+                            "hash": "0xskip",
+                            "oid": 3,
+                            "crossed": False,
+                            "tid": 0,
+                            "dir": "Spot Dust Conversion",
+                        },
+                    ],
+                ]
             }
+        ]
+    )
+
+    rows = collapse_fill_trades(payload, instrument="BTC", source_hour=0)
+
+    assert len(rows) == 1
+    assert rows[0].side == "Sell"
+    assert rows[0].px == 66436.0
+    assert rows[0].ts_ms == 1771459202061
+
+
+def test_build_hyperliquid_canonical_day_orders_trade_before_snapshot() -> None:
+    market = MarketRef(market_type="perp", instrument="BTC")
+    date = "2026-02-19"
+    store = FakeS3Store()
+    coverage = FakeCoverageRepository(
+        {
+            coverage_pk(DatasetKind.NORMALIZED_L2, market, date, "daily"): ready_coverage(
+                DatasetKind.NORMALIZED_L2, market, date
+            ),
+            coverage_pk(DatasetKind.NORMALIZED_TRADES, market, date, "daily"): ready_coverage(
+                DatasetKind.NORMALIZED_TRADES, market, date
+            ),
         }
-    }
-    snapshot = parse_l2_snapshot(raw, source_hour=9, source_line_number=14)
-    assert snapshot.instrument == "BTC"
-    assert snapshot.ts_ms == 1705309199653
-    assert '"px":"42706.0"' in snapshot.bids_json
-    assert snapshot.source_line_number == 14
-
-
-def test_source_keys_use_typed_market_paths() -> None:
-    perp = MarketRef(market_type="perp", instrument="BTC")
-    spot = MarketRef(market_type="spot", instrument="UBTC/USDC")
-    assert l2_source_key(perp, "2025-05-24", 0) == "market_data/20250524/0/l2Book/BTC.lz4"
-    assert trade_source_key("2025-05-24", 0) == "node_trades/hourly/20250524/0.lz4"
-    assert raw_l2_s3_key(spot, "2025-05-24", 0).endswith("instrument=UBTC%2FUSDC/UBTC%2FUSDC.lz4")
-
-
-def test_ingestion_request_resolves_relative_window() -> None:
-    request = IngestionRequest(
-        market_type="perp",
-        instrument="BTC",
-        start_offset_days=-2,
-        end_offset_days=-1,
     )
-    assert request.resolve_window(today=date(2025, 5, 27)) == ("2025-05-25", "2025-05-26")
+    shard_repo = FakeShardRepository()
 
-
-def test_backfill_day_skips_existing_hours() -> None:
-    market = MarketRef(market_type="perp", instrument="BTC")
-    date = "2025-05-25"
-    store = FakeS3Store()
-    coverage = FakeCoverageRepository()
-
-    for hour in range(24):
-        l2_key = raw_l2_s3_key(market, date, hour)
-        trade_key = raw_trade_s3_key(market, date, hour)
-        store.put_bytes(l2_key, f"l2-{hour}".encode("utf-8"))
-        store.put_bytes(trade_key, f"trades-{hour}".encode("utf-8"))
-        coverage.put(
-            ready_coverage(
-                DatasetKind.RAW_L2,
-                market,
-                date,
-                f"{hour:02d}",
-                byte_count=len(store.objects[l2_key]),
-            )
-        )
-        coverage.put(
-            ready_coverage(
-                DatasetKind.RAW_TRADES,
-                market,
-                date,
-                f"{hour:02d}",
-                byte_count=len(store.objects[trade_key]),
-            )
-        )
-    coverage.put(ready_coverage(DatasetKind.RAW_L2, market, date, "daily", byte_count=24))
-    coverage.put(ready_coverage(DatasetKind.RAW_TRADES, market, date, "daily", byte_count=24))
-
-    backfill_day(store, coverage, market=market, date=date)
-
-    assert store.client.get_requests == []
-
-
-def test_normalize_day_skips_when_daily_outputs_are_ready() -> None:
-    market = MarketRef(market_type="perp", instrument="BTC")
-    date = "2025-05-25"
-    store = FakeS3Store()
-    coverage = FakeCoverageRepository()
-
-    for hour in range(24):
-        l2_key = normalized_l2_s3_key(market, date, hour)
-        trade_key = normalized_trade_s3_key(market, date, hour)
-        store.put_bytes(l2_key, b"l2")
-        store.put_bytes(trade_key, b"trades")
-    coverage.put(ready_coverage(DatasetKind.NORMALIZED_L2, market, date, "daily", byte_count=72))
-    coverage.put(
-        ready_coverage(DatasetKind.NORMALIZED_TRADES, market, date, "daily", byte_count=144)
+    l2_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("bids_json", pa.large_string()),
+            ("asks_json", pa.large_string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+    trade_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("side", pa.string()),
+            ("px", pa.float64()),
+            ("sz", pa.float64()),
+            ("hash", pa.string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
     )
 
-    normalize_day(store, coverage, market=market, date=date)
+    empty_l2 = parquet_bytes([], l2_schema)
+    empty_trades = parquet_bytes([], trade_schema)
+    for hour in range(24):
+        store.objects[normalized_l2_s3_key(market, date, hour)] = empty_l2
+        store.objects[normalized_trade_s3_key(market, date, hour)] = empty_trades
 
-    assert store.get_bytes_calls == 0
+    store.objects[normalized_trade_s3_key(market, date, 0)] = parquet_bytes(
+        [
+            {
+                "ts_ms": 1000,
+                "instrument": "BTC",
+                "side": "Buy",
+                "px": 100.5,
+                "sz": 0.25,
+                "hash": "0xtrade",
+                "source_hour": 0,
+                "source_line_number": 1,
+            }
+        ],
+        trade_schema,
+    )
+    store.objects[normalized_l2_s3_key(market, date, 0)] = parquet_bytes(
+        [
+            {
+                "ts_ms": 1000,
+                "instrument": "BTC",
+                "bids_json": '[{"px":"100.0","sz":"1.0","n":2}]',
+                "asks_json": '[{"px":"101.0","sz":"1.5","n":3}]',
+                "source_hour": 0,
+                "source_line_number": 2,
+            }
+        ],
+        l2_schema,
+    )
+
+    record = build_hyperliquid_canonical_day(
+        market=market,
+        date=date,
+        depth=1,
+        s3_store=store,
+        coverage_repo=coverage,
+        shard_repo=shard_repo,
+    )
+
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
+        payload = reader.read().decode("utf-8").strip().splitlines()
+    first = orjson.loads(payload[0])
+    second = orjson.loads(payload[1])
+    assert first["Market"]["Trade"]["side"] == "Buy"
+    assert second["Market"]["L2Snapshot"]["bids"][0]["level_count"] == 2
+    assert len(second["Market"]["L2Snapshot"]["bids"]) == 1

@@ -10,3 +10,4 @@ build/
 Pulumi.*.yaml
 infra/**/Pulumi.*.yaml
 tmp/
+sample_data/

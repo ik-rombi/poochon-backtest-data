@@ -44,11 +44,31 @@ class IngestionMode(StrEnum):
     CRON = "cron"
 
 
+class OutcomesMode(StrEnum):
+    BOTH = "both"
+
+
+class CanonicalShardStatus(StrEnum):
+    READY = "READY"
+    FAILED = "FAILED"
+
+
 def _parse_date(value: str) -> date_cls:
     try:
         return date_cls.fromisoformat(value)
     except ValueError as error:
         raise ValueError(f"invalid ISO date: {value}") from error
+
+
+def iter_dates_inclusive(start_date: str, end_date: str) -> list[str]:
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if end < start:
+        raise ValueError("end_date must be on or after start_date")
+    return [
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range((end - start).days + 1)
+    ]
 
 
 class MarketRef(BaseModel):
@@ -175,10 +195,7 @@ class IngestionRequest(MarketRef):
         if explicit:
             if self.start_date is None or self.end_date is None:
                 raise ValueError("start_date and end_date are both required")
-            start = _parse_date(self.start_date)
-            end = _parse_date(self.end_date)
-            if end < start:
-                raise ValueError("end_date must be on or after start_date")
+            _ = iter_dates_inclusive(self.start_date, self.end_date)
         else:
             if self.start_offset_days is None or self.end_offset_days is None:
                 raise ValueError("start_offset_days and end_offset_days are both required")
@@ -198,12 +215,7 @@ class IngestionRequest(MarketRef):
 
     def iter_dates(self, *, today: date_cls | None = None) -> list[str]:
         start_raw, end_raw = self.resolve_window(today=today)
-        start = _parse_date(start_raw)
-        end = _parse_date(end_raw)
-        return [
-            (start + timedelta(days=offset)).isoformat()
-            for offset in range((end - start).days + 1)
-        ]
+        return iter_dates_inclusive(start_raw, end_raw)
 
     def day_request(self, date: str) -> MarketRef:
         _parse_date(date)
@@ -225,6 +237,21 @@ class PolymarketReplayCreateRequest(BaseModel):
             raise ValueError("slug is required")
         if not self.outcome.strip():
             raise ValueError("outcome is required")
+        return self
+
+
+class PolymarketSeriesSyncRequest(BaseModel):
+    series: str
+    start_date: str
+    end_date: str
+    outcomes: OutcomesMode = OutcomesMode.BOTH
+    depth: int = Field(default=5, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "PolymarketSeriesSyncRequest":
+        if not self.series.strip():
+            raise ValueError("series is required")
+        _ = iter_dates_inclusive(self.start_date, self.end_date)
         return self
 
 
@@ -315,6 +342,46 @@ class CoverageRecord(BaseModel):
         return value
 
 
+class CanonicalShardRecord(BaseModel):
+    shard_id: str
+    status: CanonicalShardStatus
+    venue: Venue
+    market_type: MarketType
+    date: str
+    depth: int
+    shard_s3_key: str
+    manifest_s3_key: str
+    event_count: int = 0
+    instrument: str | None = None
+    series_key: str | None = None
+    outcomes: str | None = None
+    start_ts_ms: int | None = None
+    end_ts_ms: int | None = None
+    created_at: str
+    updated_at: str
+    source_refs: tuple[str, ...] = ()
+    error: str | None = None
+
+
+class CanonicalWindowManifest(BaseModel):
+    venue: Venue
+    market_type: MarketType
+    start_date: str
+    end_date: str
+    depth: int
+    instrument: str | None = None
+    series_key: str | None = None
+    outcomes: str | None = None
+    shard_count: int
+    event_count: int
+    start_ts_ms: int | None
+    end_ts_ms: int | None
+    shard_ids: tuple[str, ...]
+    shard_keys: tuple[str, ...]
+    shards: tuple[CanonicalShardRecord, ...]
+    stream_path: str
+
+
 def utc_now_iso() -> str:
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat()
 
@@ -362,6 +429,69 @@ def replay_manifest_s3_key(request: ReplayRequest) -> str:
     )
 
 
+def canonical_hyperliquid_shard_id(market: MarketRef, date: str, depth: int) -> str:
+    canonical = (
+        f"canonical|{market.venue.value}|{market.market_type.value}|"
+        f"{market.instrument}|{date}|depth={depth}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def canonical_polymarket_shard_id(
+    *,
+    series_key: str,
+    date: str,
+    outcomes: OutcomesMode,
+    depth: int,
+) -> str:
+    canonical = f"canonical|polymarket|{series_key}|{date}|outcomes={outcomes.value}|depth={depth}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def canonical_hyperliquid_s3_key(market: MarketRef, date: str, depth: int) -> str:
+    return (
+        "canonical/hyperliquid/"
+        f"market_type={market.market_type.value}/instrument={market.encoded_instrument()}/"
+        f"date={date}/depth={depth}/events.jsonl.zst"
+    )
+
+
+def canonical_hyperliquid_manifest_s3_key(market: MarketRef, date: str, depth: int) -> str:
+    return (
+        "canonical/hyperliquid/"
+        f"market_type={market.market_type.value}/instrument={market.encoded_instrument()}/"
+        f"date={date}/depth={depth}/manifest.json"
+    )
+
+
+def canonical_polymarket_s3_key(
+    *,
+    series_key: str,
+    date: str,
+    outcomes: OutcomesMode,
+    depth: int,
+) -> str:
+    return (
+        "canonical/polymarket/"
+        f"series={quote(series_key, safe='')}/outcomes={outcomes.value}/"
+        f"date={date}/depth={depth}/events.jsonl.zst"
+    )
+
+
+def canonical_polymarket_manifest_s3_key(
+    *,
+    series_key: str,
+    date: str,
+    outcomes: OutcomesMode,
+    depth: int,
+) -> str:
+    return (
+        "canonical/polymarket/"
+        f"series={quote(series_key, safe='')}/outcomes={outcomes.value}/"
+        f"date={date}/depth={depth}/manifest.json"
+    )
+
+
 def normalized_l2_s3_key(market: MarketRef, date: str, hour: int) -> str:
     return (
         "normalized/hyperliquid/l2_snapshot/"
@@ -386,12 +516,16 @@ def raw_l2_s3_key(market: MarketRef, date: str, hour: int) -> str:
     )
 
 
-def raw_trade_s3_key(market: MarketRef, date: str, hour: int) -> str:
+def raw_fill_s3_key(market: MarketRef, date: str, hour: int) -> str:
     return (
-        "raw/hyperliquid/node_trades/"
+        "raw/hyperliquid/node_fills_by_block/"
         f"market_type={market.market_type.value}/date={date}/hour={hour:02d}/"
         f"instrument={market.encoded_instrument()}/part-{hour:02d}.lz4"
     )
+
+
+def raw_trade_s3_key(market: MarketRef, date: str, hour: int) -> str:
+    return raw_fill_s3_key(market, date, hour)
 
 
 def polymarket_metadata_s3_key(resolution: PolymarketMarketResolution) -> str:

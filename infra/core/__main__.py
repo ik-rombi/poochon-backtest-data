@@ -49,6 +49,16 @@ replay_table = aws.dynamodb.Table(
     tags={"Project": "poochon-backtest-data", "Stack": stack},
 )
 
+replay_shard_table = aws.dynamodb.Table(
+    "replay-shard-table",
+    name=f"{prefix}-replay-shards-{stack}",
+    billing_mode="PAY_PER_REQUEST",
+    hash_key="shard_id",
+    attributes=[aws.dynamodb.TableAttributeArgs(name="shard_id", type="S")],
+    tags={"Project": "poochon-backtest-data", "Stack": stack},
+)
+
 pulumi.export("data_bucket_name", data_bucket.bucket)
 pulumi.export("coverage_table_name", coverage_table.name)
 pulumi.export("replay_table_name", replay_table.name)
+pulumi.export("replay_shard_table_name", replay_shard_table.name)

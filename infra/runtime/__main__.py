@@ -17,20 +17,21 @@ ingestion_mode = (config.get("ingestionMode") or "disabled").lower()
 ingestion_venue = (config.get("ingestionVenue") or "hyperliquid").lower()
 ingestion_market_type = config.get("ingestionMarketType") or "perp"
 ingestion_instrument = config.get("ingestionInstrument") or "BTC"
+ingestion_series = config.get("ingestionSeries") or "btc-updown-5m"
+ingestion_outcomes = config.get("ingestionOutcomes") or "both"
 ingestion_start_date = config.get("ingestionStartDate")
 ingestion_end_date = config.get("ingestionEndDate")
 ingestion_start_offset_days = config.get_int("ingestionStartOffsetDays")
 ingestion_end_offset_days = config.get_int("ingestionEndOffsetDays")
+ingestion_depth = config.get_int("ingestionDepth")
 ingestion_start_at = config.get("ingestionStartAt")
 cron_expression = config.get("cronExpression")
-ingestion_slug = config.get("ingestionSlug")
-ingestion_outcome = config.get("ingestionOutcome")
 telonex_api_key = config.get_secret("telonexApiKey")
 
 core = pulumi.StackReference(core_stack_ref)
 bucket_name = core.require_output("data_bucket_name")
 coverage_table_name = core.require_output("coverage_table_name")
-replay_table_name = core.require_output("replay_table_name")
+replay_shard_table_name = core.require_output("replay_shard_table_name")
 
 region = aws.get_region_output()
 caller = aws.get_caller_identity_output()
@@ -44,10 +45,13 @@ def build_ingestion_input() -> dict[str, int | str]:
     if ingestion_venue == "polymarket":
         if ingestion_mode == "cron":
             raise ValueError("cron ingestion is not supported for polymarket")
-        if not ingestion_slug or not ingestion_outcome:
-            raise ValueError("ingestionSlug and ingestionOutcome are required for polymarket ingestion")
-        payload["slug"] = ingestion_slug
-        payload["outcome"] = ingestion_outcome
+        if not ingestion_start_date or not ingestion_end_date:
+            raise ValueError("ingestionStartDate and ingestionEndDate are required for polymarket")
+        payload["series"] = ingestion_series
+        payload["outcomes"] = ingestion_outcomes
+        payload["start_date"] = ingestion_start_date
+        payload["end_date"] = ingestion_end_date
+        payload["depth"] = ingestion_depth or 5
         return payload
     if ingestion_venue != "hyperliquid":
         raise ValueError("ingestionVenue must be hyperliquid or polymarket")
@@ -62,6 +66,7 @@ def build_ingestion_input() -> dict[str, int | str]:
         )
     payload["market_type"] = ingestion_market_type
     payload["instrument"] = ingestion_instrument
+    payload["depth"] = ingestion_depth or 20
     if explicit:
         if ingestion_start_date is None or ingestion_end_date is None:
             raise ValueError("ingestionStartDate and ingestionEndDate are both required")
@@ -200,10 +205,7 @@ task_sg = aws.ec2.SecurityGroup(
 
 cluster = aws.ecs.Cluster("runtime-cluster", name=f"{prefix}-{stack}")
 
-log_group = aws.cloudwatch.LogGroup(
-    "runtime-log-group",
-    retention_in_days=7,
-)
+log_group = aws.cloudwatch.LogGroup("runtime-log-group", retention_in_days=7)
 
 ecr_repo = aws.ecr.Repository(
     "app-repository",
@@ -291,7 +293,7 @@ aws.iam.RolePolicy(
         bucket_arn,
         bucket_objects_arn,
         coverage_table_name,
-        replay_table_name,
+        replay_shard_table_name,
         region.name,
         caller.account_id,
     ).apply(
@@ -396,9 +398,9 @@ base_env = {
     "POOCHON_AWS_REGION": aws.config.region,
     "POOCHON_DATA_BUCKET": bucket_name,
     "POOCHON_COVERAGE_TABLE_NAME": coverage_table_name,
-    "POOCHON_REPLAY_TABLE_NAME": replay_table_name,
+    "POOCHON_SHARD_TABLE_NAME": replay_shard_table_name,
 }
-ingest_container_secrets = (
+sync_container_secrets = (
     {"POOCHON_TELONEX_API_KEY": telonex_secret.arn}
     if telonex_secret is not None
     else {}
@@ -409,11 +411,11 @@ runtime_platform = aws.ecs.TaskDefinitionRuntimePlatformArgs(
     operating_system_family="LINUX",
 )
 
-ingest_task_definition = aws.ecs.TaskDefinition(
-    "ingest-task-definition",
-    family=f"{prefix}-ingest-{stack}",
-    cpu="1024",
-    memory="2048",
+sync_task_definition = aws.ecs.TaskDefinition(
+    "sync-task-definition",
+    family=f"{prefix}-sync-{stack}",
+    cpu="4096",
+    memory="16384",
     network_mode="awsvpc",
     requires_compatibilities=["FARGATE"],
     execution_role_arn=execution_role.arn,
@@ -425,7 +427,7 @@ ingest_task_definition = aws.ecs.TaskDefinition(
             "python",
             "-m",
             "poochon_backtest_data.cli",
-            "ingest-range",
+            "hyperliquid-sync-window",
             "--market-type",
             ingestion_market_type,
             "--instrument",
@@ -434,40 +436,11 @@ ingest_task_definition = aws.ecs.TaskDefinition(
             ingestion_start_date or "1970-01-01",
             "--end-date",
             ingestion_end_date or "1970-01-01",
-        ],
-        env=base_env,
-        secrets=ingest_container_secrets,
-        log_group_name=log_group.name,
-    ),
-)
-
-materialize_task_definition = aws.ecs.TaskDefinition(
-    "materialize-task-definition",
-    family=f"{prefix}-materialize-{stack}",
-    cpu="1024",
-    memory="2048",
-    network_mode="awsvpc",
-    requires_compatibilities=["FARGATE"],
-    execution_role_arn=execution_role.arn,
-    task_role_arn=task_role.arn,
-    runtime_platform=runtime_platform,
-    container_definitions=container_definitions(
-        image_name=image.image_name,
-        command=[
-            "python",
-            "-m",
-            "poochon_backtest_data.cli",
-            "materialize-replay",
-            "--market-type",
-            ingestion_market_type,
-            "--instrument",
-            ingestion_instrument,
-            "--date",
-            ingestion_start_date or "1970-01-01",
             "--depth",
-            "20",
+            str(ingestion_depth or 20),
         ],
         env=base_env,
+        secrets=sync_container_secrets,
         log_group_name=log_group.name,
     ),
 )
@@ -492,8 +465,7 @@ aws.iam.RolePolicy(
     role=step_role.id,
     policy=pulumi.Output.all(
         cluster.arn,
-        ingest_task_definition.arn,
-        materialize_task_definition.arn,
+        sync_task_definition.arn,
         execution_role.arn,
         task_role.arn,
     ).apply(
@@ -508,7 +480,7 @@ aws.iam.RolePolicy(
                             "ecs:StopTask",
                             "ecs:DescribeTasks",
                         ],
-                        "Resource": [args[1], args[2]],
+                        "Resource": [args[1]],
                     },
                     {
                         "Effect": "Allow",
@@ -518,7 +490,7 @@ aws.iam.RolePolicy(
                     {
                         "Effect": "Allow",
                         "Action": ["iam:PassRole"],
-                        "Resource": [args[3], args[4]],
+                        "Resource": [args[2], args[3]],
                     },
                     {
                         "Effect": "Allow",
@@ -536,10 +508,10 @@ aws.iam.RolePolicy(
 )
 
 
-def ecs_run_task_state(task_definition_arn: pulumi.Input[str], command_state: str) -> pulumi.Output[dict]:
+def ecs_run_task_state(command_state: str) -> pulumi.Output[dict]:
     return pulumi.Output.all(
         cluster=cluster.arn,
-        task_definition=task_definition_arn,
+        task_definition=sync_task_definition.arn,
         network=task_network,
     ).apply(
         lambda values: {
@@ -565,17 +537,14 @@ def ecs_run_task_state(task_definition_arn: pulumi.Input[str], command_state: st
 
 
 ingestion_definition = pulumi.Output.all(
-    explicit=ecs_run_task_state(
-        ingest_task_definition.arn,
-        "States.Array('python','-m','poochon_backtest_data.cli','ingest-range','--market-type',$.market_type,'--instrument',$.instrument,'--start-date',$.start_date,'--end-date',$.end_date)",
+    hyperliquid_explicit=ecs_run_task_state(
+        "States.Array('python','-m','poochon_backtest_data.cli','hyperliquid-sync-window','--market-type',$.market_type,'--instrument',$.instrument,'--start-date',$.start_date,'--end-date',$.end_date,'--depth',States.Format('{}',$.depth))"
     ),
-    relative=ecs_run_task_state(
-        ingest_task_definition.arn,
-        "States.Array('python','-m','poochon_backtest_data.cli','ingest-range','--market-type',$.market_type,'--instrument',$.instrument,'--start-offset-days',States.Format('{}',$.start_offset_days),'--end-offset-days',States.Format('{}',$.end_offset_days))",
+    hyperliquid_relative=ecs_run_task_state(
+        "States.Array('python','-m','poochon_backtest_data.cli','hyperliquid-sync-window','--market-type',$.market_type,'--instrument',$.instrument,'--start-offset-days',States.Format('{}',$.start_offset_days),'--end-offset-days',States.Format('{}',$.end_offset_days),'--depth',States.Format('{}',$.depth))"
     ),
     polymarket=ecs_run_task_state(
-        ingest_task_definition.arn,
-        "States.Array('python','-m','poochon_backtest_data.cli','polymarket-ingest-market','--slug',$.slug,'--outcome',$.outcome)",
+        "States.Array('python','-m','poochon_backtest_data.cli','polymarket-sync-series','--series',$.series,'--start-date',$.start_date,'--end-date',$.end_date,'--outcomes',$.outcomes,'--depth',States.Format('{}',$.depth))"
     ),
 ).apply(
     lambda states: json.dumps(
@@ -588,7 +557,7 @@ ingestion_definition = pulumi.Output.all(
                         {
                             "Variable": "$.venue",
                             "StringEquals": "polymarket",
-                            "Next": "IngestPolymarket",
+                            "Next": "SyncPolymarketSeries",
                         },
                         {
                             "Variable": "$.venue",
@@ -604,19 +573,19 @@ ingestion_definition = pulumi.Output.all(
                         {
                             "Variable": "$.start_date",
                             "IsPresent": True,
-                            "Next": "IngestRangeExplicit",
+                            "Next": "SyncHyperliquidExplicit",
                         },
                         {
                             "Variable": "$.start_offset_days",
                             "IsPresent": True,
-                            "Next": "IngestRangeRelative",
+                            "Next": "SyncHyperliquidRelative",
                         },
                     ],
                     "Default": "MissingWindow",
                 },
-                "IngestRangeExplicit": {**states["explicit"], "End": True},
-                "IngestRangeRelative": {**states["relative"], "End": True},
-                "IngestPolymarket": {**states["polymarket"], "End": True},
+                "SyncHyperliquidExplicit": {**states["hyperliquid_explicit"], "End": True},
+                "SyncHyperliquidRelative": {**states["hyperliquid_relative"], "End": True},
+                "SyncPolymarketSeries": {**states["polymarket"], "End": True},
                 "MissingVenue": {
                     "Type": "Fail",
                     "Error": "MissingVenue",
@@ -638,56 +607,11 @@ ingestion_state_machine = aws.sfn.StateMachine(
     definition=ingestion_definition,
 )
 
-materialize_definition = ecs_run_task_state(
-    materialize_task_definition.arn,
-    "States.Array('python','-m','poochon_backtest_data.cli','materialize-replay','--market-type',$.market_type,'--instrument',$.instrument,'--date',$.date,'--depth',States.Format('{}',$.depth))",
-)
-
-materialize_definition = pulumi.Output.all(
-    hyperliquid=materialize_definition,
-    polymarket=ecs_run_task_state(
-        materialize_task_definition.arn,
-        "States.Array('python','-m','poochon_backtest_data.cli','polymarket-materialize-replay','--slug',$.slug,'--outcome',$.outcome,'--depth',States.Format('{}',$.depth))",
-    ),
-).apply(
-    lambda states: json.dumps(
-        {
-            "StartAt": "ResolveVenue",
-            "States": {
-                "ResolveVenue": {
-                    "Type": "Choice",
-                    "Choices": [
-                        {
-                            "Variable": "$.venue",
-                            "StringEquals": "polymarket",
-                            "Next": "MaterializePolymarketReplay",
-                        },
-                        {
-                            "Variable": "$.venue",
-                            "StringEquals": "hyperliquid",
-                            "Next": "MaterializeHyperliquidReplay",
-                        },
-                    ],
-                    "Default": "MaterializeHyperliquidReplay",
-                },
-                "MaterializeHyperliquidReplay": {**states["hyperliquid"], "End": True},
-                "MaterializePolymarketReplay": {**states["polymarket"], "End": True},
-            },
-        }
-    )
-)
-
-materialize_state_machine = aws.sfn.StateMachine(
-    "materialize-state-machine",
-    role_arn=step_role.arn,
-    definition=materialize_definition,
-)
-
 api_task_definition = aws.ecs.TaskDefinition(
     "api-task-definition",
     family=f"{prefix}-api-{stack}",
-    cpu="512",
-    memory="1024",
+    cpu="1024",
+    memory="2048",
     network_mode="awsvpc",
     requires_compatibilities=["FARGATE"],
     execution_role_arn=execution_role.arn,
@@ -696,28 +620,9 @@ api_task_definition = aws.ecs.TaskDefinition(
     container_definitions=container_definitions(
         image_name=image.image_name,
         command=["python", "-m", "poochon_backtest_data.cli", "api"],
-        env={**base_env, "POOCHON_REPLAY_STATE_MACHINE_ARN": materialize_state_machine.arn},
+        env=base_env,
         log_group_name=log_group.name,
         port=8080,
-    ),
-)
-
-aws.iam.RolePolicy(
-    "ecs-task-stepfunctions-policy",
-    role=task_role.id,
-    policy=materialize_state_machine.arn.apply(
-        lambda arn: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["states:StartExecution"],
-                        "Resource": [arn],
-                    }
-                ],
-            }
-        )
     ),
 )
 
@@ -831,7 +736,6 @@ api_service = aws.ecs.Service(
 pulumi.export("cluster_arn", cluster.arn)
 pulumi.export("api_url", alb.dns_name.apply(lambda dns: f"http://{dns}"))
 pulumi.export("ingestion_state_machine_arn", ingestion_state_machine.arn)
-pulumi.export("materialize_state_machine_arn", materialize_state_machine.arn)
 pulumi.export(
     "ingestion_schedule_name",
     pulumi.Output.from_input(None)

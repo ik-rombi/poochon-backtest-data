@@ -10,7 +10,7 @@ from botocore.exceptions import ClientError
 import orjson
 import zstandard
 
-from .models import CoverageRecord, ReplayRecord
+from .models import CanonicalShardRecord, CoverageRecord, ReplayRecord
 
 
 def boto3_session(region: str):
@@ -19,8 +19,12 @@ def boto3_session(region: str):
 
 class S3Store:
     def __init__(self, session: boto3.session.Session, bucket: str):
+        self.region = session.region_name or "eu-west-1"
         self.bucket = bucket
         self.client = session.client("s3")
+
+    def clone(self) -> "S3Store":
+        return S3Store(boto3_session(self.region), self.bucket)
 
     def put_bytes(
         self,
@@ -83,7 +87,12 @@ class S3Store:
 
 class CoverageRepository:
     def __init__(self, session: boto3.session.Session, table_name: str):
+        self.region = session.region_name or "eu-west-1"
+        self.table_name = table_name
         self.table = session.resource("dynamodb").Table(table_name)
+
+    def clone(self) -> "CoverageRepository":
+        return CoverageRepository(boto3_session(self.region), self.table_name)
 
     def get(self, pk: str) -> CoverageRecord | None:
         response = self.table.get_item(Key={"pk": pk})
@@ -123,4 +132,24 @@ class ReplayRepository:
             return existing
 
     def put(self, record: ReplayRecord) -> None:
+        self.table.put_item(Item=record.model_dump(mode="json"))
+
+
+class CanonicalShardRepository:
+    def __init__(self, session: boto3.session.Session, table_name: str):
+        self.region = session.region_name or "eu-west-1"
+        self.table_name = table_name
+        self.table = session.resource("dynamodb").Table(table_name)
+
+    def clone(self) -> "CanonicalShardRepository":
+        return CanonicalShardRepository(boto3_session(self.region), self.table_name)
+
+    def get(self, shard_id: str) -> CanonicalShardRecord | None:
+        response = self.table.get_item(Key={"shard_id": shard_id})
+        item = response.get("Item")
+        if not item:
+            return None
+        return CanonicalShardRecord.model_validate(item)
+
+    def put(self, record: CanonicalShardRecord) -> None:
         self.table.put_item(Item=record.model_dump(mode="json"))

@@ -4,62 +4,130 @@ from fastapi.testclient import TestClient
 
 from poochon_backtest_data.api import create_app
 from poochon_backtest_data.models import (
-    PolymarketReplayCreateRequest,
-    ReplayRequest,
-    ReplayStatus,
-    new_pending_replay,
+    CanonicalShardRecord,
+    CanonicalShardStatus,
+    CanonicalWindowManifest,
+    MarketType,
+    Venue,
 )
 from poochon_backtest_data.settings import Settings
 
 
-class FakeReplayService:
+class FakeCanonicalReplayService:
     def __init__(self):
-        self.record = new_pending_replay(
-            ReplayRequest(market_type="perp", instrument="BTC", date="2025-05-24")
+        self.hyper_manifest = CanonicalWindowManifest(
+            venue=Venue.HYPERLIQUID,
+            market_type=MarketType.PERP,
+            instrument="BTC",
+            series_key=None,
+            outcomes=None,
+            start_date="2026-02-19",
+            end_date="2026-02-21",
+            depth=20,
+            shard_count=1,
+            event_count=2,
+            start_ts_ms=1,
+            end_ts_ms=2,
+            shard_ids=("shard-1",),
+            shard_keys=("canonical/hyperliquid/one",),
+            shards=(
+                CanonicalShardRecord(
+                    shard_id="shard-1",
+                    status=CanonicalShardStatus.READY,
+                    venue=Venue.HYPERLIQUID,
+                    market_type=MarketType.PERP,
+                    instrument="BTC",
+                    series_key=None,
+                    outcomes=None,
+                    date="2026-02-19",
+                    depth=20,
+                    shard_s3_key="canonical/hyperliquid/one",
+                    manifest_s3_key="canonical/hyperliquid/one.json",
+                    event_count=2,
+                    start_ts_ms=1,
+                    end_ts_ms=2,
+                    created_at="2026-04-09T00:00:00+00:00",
+                    updated_at="2026-04-09T00:00:00+00:00",
+                ),
+            ),
+            stream_path="/api/v1/canonical/hyperliquid/perp/BTC/stream",
         )
 
-    def submit_replay(self, request: ReplayRequest):
-        return self.record
+    def get_hyperliquid_manifest(self, **_: object):
+        return self.hyper_manifest
 
-    def submit_polymarket_replay(self, request: PolymarketReplayCreateRequest):
-        return self.record
+    def get_polymarket_manifest(self, **_: object):
+        return self.hyper_manifest.model_copy(
+            update={
+                "venue": Venue.POLYMARKET,
+                "market_type": MarketType.BINARY,
+                "instrument": None,
+                "series_key": "btc-updown-5m",
+                "outcomes": "both",
+                "stream_path": "/api/v1/canonical/polymarket/btc-updown-5m/stream",
+            }
+        )
 
-    def get_replay(self, replay_id: str):
-        if replay_id != self.record.replay_id:
-            return None
-        return self.record
+    def stream_manifest(self, manifest: CanonicalWindowManifest):
+        if manifest.venue == Venue.HYPERLIQUID:
+            return iter(
+                [
+                    b'{"Market":{"Trade":{"instrument":{"venue":"Hyperliquid","symbol":"BTC"},"ts_ms":1,"px":100.0,"sz":0.1,"side":"Buy"}}}\n'
+                ]
+            )
+        return iter(
+            [
+                b'{"Market":{"Trade":{"instrument":{"venue":"Polymarket","symbol":"btc-updown-5m-1:Up"},"ts_ms":1,"px":0.5,"sz":10.0,"side":"Buy"}}}\n'
+            ]
+        )
 
-    def stream_replay(self, replay_id: str):
-        if replay_id != self.record.replay_id:
-            raise KeyError(replay_id)
-        if self.record.status != ReplayStatus.READY:
-            raise RuntimeError(f"replay {replay_id} is not ready")
-        return iter([b'{"Market":{"Trade":{"instrument":{"venue":"Hyperliquid","symbol":"BTC"},"ts_ms":1,"px":100.0,"sz":0.1,"side":"Buy"}}}\n'])
+
+def test_post_replay_endpoints_are_deprecated() -> None:
+    client = TestClient(create_app(Settings(), replay_service=FakeCanonicalReplayService()))
+    assert client.post("/api/v1/replays").status_code == 410
+    assert client.post("/api/v1/polymarket/replays").status_code == 410
 
 
-def test_api_returns_202_for_pending_replay() -> None:
-    client = TestClient(create_app(Settings(), replay_service=FakeReplayService()))
-    response = client.post(
-        "/api/v1/replays",
-        json={"market_type": "perp", "instrument": "BTC", "date": "2025-05-24"},
+def test_get_hyperliquid_manifest_and_stream() -> None:
+    client = TestClient(create_app(Settings(), replay_service=FakeCanonicalReplayService()))
+    manifest = client.get(
+        "/api/v1/canonical/hyperliquid/perp/BTC",
+        params={"start_date": "2026-02-19", "end_date": "2026-02-21", "depth": 20},
     )
-    assert response.status_code == 202
+    assert manifest.status_code == 200
+    assert manifest.json()["event_count"] == 2
 
-
-def test_api_streams_ndjson_when_replay_ready() -> None:
-    service = FakeReplayService()
-    service.record.status = ReplayStatus.READY
-    client = TestClient(create_app(Settings(), replay_service=service))
-    response = client.get(f"/api/v1/replays/{service.record.replay_id}/stream")
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("application/x-ndjson")
-    assert '"Trade"' in response.text
-
-
-def test_api_accepts_polymarket_replay_creation() -> None:
-    client = TestClient(create_app(Settings(), replay_service=FakeReplayService()))
-    response = client.post(
-        "/api/v1/polymarket/replays",
-        json={"slug": "btc-updown-5m-1775181000", "outcome": "Up", "depth": 5},
+    stream = client.get(
+        "/api/v1/canonical/hyperliquid/perp/BTC/stream",
+        params={"start_date": "2026-02-19", "end_date": "2026-02-21", "depth": 20},
     )
-    assert response.status_code == 202
+    assert stream.status_code == 200
+    assert stream.headers["content-type"].startswith("application/x-ndjson")
+    assert '"Hyperliquid"' in stream.text
+
+
+def test_get_polymarket_manifest_and_stream() -> None:
+    client = TestClient(create_app(Settings(), replay_service=FakeCanonicalReplayService()))
+    manifest = client.get(
+        "/api/v1/canonical/polymarket/btc-updown-5m",
+        params={
+            "start_date": "2026-02-19",
+            "end_date": "2026-02-21",
+            "outcomes": "both",
+            "depth": 5,
+        },
+    )
+    assert manifest.status_code == 200
+    assert manifest.json()["series_key"] == "btc-updown-5m"
+
+    stream = client.get(
+        "/api/v1/canonical/polymarket/btc-updown-5m/stream",
+        params={
+            "start_date": "2026-02-19",
+            "end_date": "2026-02-21",
+            "outcomes": "both",
+            "depth": 5,
+        },
+    )
+    assert stream.status_code == 200
+    assert '"Polymarket"' in stream.text

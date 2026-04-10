@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     data_bucket: str | None = None
     coverage_table_name: str | None = None
     replay_table_name: str | None = None
+    shard_table_name: str | None = None
     replay_state_machine_arn: str | None = None
     telonex_api_key: str | None = None
 
