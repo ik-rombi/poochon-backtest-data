@@ -37,6 +37,7 @@ from .storage import CanonicalShardRepository, CoverageRepository, S3Store
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 VATIC_BASE_URL = "https://api.vatic.trading"
 BINANCE_BASE_URL = "https://api.binance.com"
+BINANCE_US_BASE_URL = "https://api.binance.us"
 TELONEX_DOWNLOAD_BASE_URL = "https://api.telonex.io/v1/downloads/polymarket"
 BOOK_CHANNEL = "book_snapshot_5"
 TRADE_CHANNEL = "trades"
@@ -251,9 +252,11 @@ def _fetch_binance_price_to_beat(
     *,
     asset: str,
     start_ts_ms: int,
+    base_url: str = BINANCE_BASE_URL,
+    source: str = "binance_open_1m",
 ) -> PriceToBeat | None:
     response = client.get(
-        f"{BINANCE_BASE_URL}/api/v3/klines",
+        f"{base_url}/api/v3/klines",
         params={
             "symbol": f"{asset.upper()}USDT",
             "interval": "1m",
@@ -269,7 +272,7 @@ def _fetch_binance_price_to_beat(
     first = payload[0]
     if len(first) < 2:
         return None
-    return PriceToBeat(price=float(first[1]), source="binance_open_1m", quality="proxy")
+    return PriceToBeat(price=float(first[1]), source=source, quality="proxy")
 
 
 def _fetch_price_to_beat(
@@ -288,7 +291,18 @@ def _fetch_price_to_beat(
     except (httpx.HTTPError, ValueError):
         pass
     try:
-        return _fetch_binance_price_to_beat(client, asset=asset, start_ts_ms=start_ts_ms)
+        if proxy := _fetch_binance_price_to_beat(client, asset=asset, start_ts_ms=start_ts_ms):
+            return proxy
+    except (httpx.HTTPError, ValueError):
+        pass
+    try:
+        return _fetch_binance_price_to_beat(
+            client,
+            asset=asset,
+            start_ts_ms=start_ts_ms,
+            base_url=BINANCE_US_BASE_URL,
+            source="binance_us_open_1m",
+        )
     except (httpx.HTTPError, ValueError):
         return None
 
@@ -778,6 +792,7 @@ def sync_series(
             depth=request.depth,
             s3_store=destination,
             shard_repo=shard_repo,
+            force=True,
         )
     return resolutions
 

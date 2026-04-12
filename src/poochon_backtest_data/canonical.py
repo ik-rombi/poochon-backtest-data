@@ -394,6 +394,7 @@ def _build_polymarket_shard_from_tasks(
     pending_fetches: list[tuple[int, str, str, Callable[[dict[str, Any]], bool] | None]],
     s3_store: S3Store,
     shard_repo: CanonicalShardRepository,
+    force: bool = False,
 ) -> CanonicalShardRecord:
     if not pending_fetches:
         return _materialize_polymarket_shard(
@@ -409,6 +410,7 @@ def _build_polymarket_shard_from_tasks(
             s3_store=s3_store,
             shard_repo=shard_repo,
             source_refs=[],
+            force=force,
         )
 
     fragment_stream_limit = 64
@@ -464,6 +466,7 @@ def _build_polymarket_shard_from_tasks(
             s3_store=s3_store,
             shard_repo=shard_repo,
             source_refs=source_refs,
+            force=force,
         )
     finally:
         shutil.rmtree(fragment_dir, ignore_errors=True)
@@ -483,10 +486,16 @@ def _materialize_polymarket_shard(
     s3_store: S3Store,
     shard_repo: CanonicalShardRepository,
     source_refs: list[str],
+    force: bool = False,
 ) -> CanonicalShardRecord:
     existing = shard_repo.get(shard_id)
-    if existing is not None and existing.status == CanonicalShardStatus.READY and s3_store.exists(
+    if (
+        not force
+        and existing is not None
+        and existing.status == CanonicalShardStatus.READY
+        and s3_store.exists(
         existing.shard_s3_key
+        )
     ):
         return existing
 
@@ -777,6 +786,7 @@ def build_polymarket_canonical_day(
     s3_store: S3Store,
     coverage_repo: CoverageRepository,
     shard_repo: CanonicalShardRepository,
+    force: bool = False,
 ) -> CanonicalShardRecord:
     active_resolutions = [resolution for resolution in resolutions if date in resolution.dates]
     if not active_resolutions:
@@ -839,6 +849,7 @@ def build_polymarket_canonical_day(
         pending_fetches=pending_fetches,
         s3_store=s3_store,
         shard_repo=shard_repo,
+        force=force,
     )
 
 
@@ -933,6 +944,7 @@ def build_polymarket_canonical_day_from_storage(
     depth: int,
     s3_store: S3Store,
     shard_repo: CanonicalShardRepository,
+    force: bool = False,
 ) -> CanonicalShardRecord:
     shard_id = canonical_polymarket_shard_id(
         series_key=series_key,
@@ -1018,4 +1030,5 @@ def build_polymarket_canonical_day_from_storage(
         pending_fetches=pending_fetches,
         s3_store=s3_store,
         shard_repo=shard_repo,
+        force=force,
     )

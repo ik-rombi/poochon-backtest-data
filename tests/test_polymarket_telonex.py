@@ -224,6 +224,28 @@ def test_resolve_market_falls_back_to_binance_for_price_to_beat() -> None:
     client.close()
 
 
+def test_fetch_price_to_beat_falls_back_to_binance_us(monkeypatch) -> None:
+    monkeypatch.setattr(polymarket_telonex, "_fetch_vatic_price_to_beat", lambda *args, **kwargs: None)
+
+    def fake_binance(client, *, asset, start_ts_ms, base_url=polymarket_telonex.BINANCE_BASE_URL, source="binance_open_1m"):
+        if base_url == polymarket_telonex.BINANCE_BASE_URL:
+            return None
+        return polymarket_telonex.PriceToBeat(price=66461.31, source=source, quality="proxy")
+
+    monkeypatch.setattr(polymarket_telonex, "_fetch_binance_price_to_beat", fake_binance)
+
+    price = polymarket_telonex._fetch_price_to_beat(
+        httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500))),
+        slug="btc-updown-5m-1771459200",
+        start_ts_ms=1771459200000,
+    )
+
+    assert price is not None
+    assert price.price == 66461.31
+    assert price.source == "binance_us_open_1m"
+    assert price.quality == "proxy"
+
+
 def test_resolve_market_uses_slug_window_for_contract_bounds() -> None:
     client = mock_client(
         {
@@ -646,6 +668,124 @@ def test_build_polymarket_canonical_day_from_storage_scans_normalized_objects() 
     assert any('"btc-updown-5m-1:Down"' in line for line in payload)
 
 
+def test_build_polymarket_canonical_day_from_storage_emits_listed_next_for_adjacent_contracts() -> None:
+    date = "2026-02-19"
+    store = FakeS3Store()
+    shard_repo = FakeShardRepository()
+
+    class FakePaginator:
+        def __init__(self, objects):
+            self.objects = objects
+
+        def paginate(self, **kwargs):
+            yield {"Contents": [{"Key": key} for key in self.objects if key.startswith(kwargs["Prefix"])]}
+
+    class FakeS3Client:
+        def __init__(self, objects):
+            self.objects = objects
+
+        def get_paginator(self, name: str):
+            assert name == "list_objects_v2"
+            return FakePaginator(self.objects)
+
+    store.bucket = "test-bucket"
+    store.client = FakeS3Client(store.objects)
+
+    l2_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("bids_json", pa.large_string()),
+            ("asks_json", pa.large_string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+    trade_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("side", pa.string()),
+            ("px", pa.float64()),
+            ("sz", pa.float64()),
+            ("hash", pa.string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+
+    resolutions = [
+        PolymarketMarketResolution(
+            slug=f"btc-updown-5m-{start}",
+            question="q",
+            outcome=outcome,
+            market_id=f"0x{start}",
+            asset_id=f"asset-{start}-{outcome.lower()}",
+            instrument=f"btc-updown-5m-{start}:{outcome}",
+            start_time="2026-02-19T00:00:00+00:00",
+            end_time="2026-02-19T00:05:00+00:00",
+            start_ts_ms=start * 1000,
+            end_ts_ms=(start + 300) * 1000,
+            dates=(date,),
+            price_to_beat=66000.0,
+            price_to_beat_source="vatic",
+            price_to_beat_quality="exact",
+        )
+        for start in (1771459200, 1771459500)
+        for outcome in ("Up", "Down")
+    ]
+
+    for resolution in resolutions:
+        market = resolution.market_ref()
+        ts_ms = resolution.start_ts_ms + 1_000
+        store.put_json(polymarket_metadata_s3_key(resolution), resolution.model_dump(mode="json"))
+        store.objects[polymarket_normalized_trade_s3_key(market, resolution.market_id, date)] = parquet_bytes(
+            [
+                {
+                    "ts_ms": ts_ms,
+                    "instrument": resolution.instrument,
+                    "side": "Buy",
+                    "px": 0.5,
+                    "sz": 10.0,
+                    "hash": f"hash-{resolution.slug}-{resolution.outcome}",
+                    "source_hour": 0,
+                    "source_line_number": 1,
+                }
+            ],
+            trade_schema,
+        )
+        store.objects[polymarket_normalized_l2_s3_key(market, resolution.market_id, date)] = parquet_bytes(
+            [
+                {
+                    "ts_ms": ts_ms,
+                    "instrument": resolution.instrument,
+                    "bids_json": '[{"px":"0.49","sz":"10","n":0}]',
+                    "asks_json": '[{"px":"0.51","sz":"11","n":0}]',
+                    "source_hour": 0,
+                    "source_line_number": 2,
+                }
+            ],
+            l2_schema,
+        )
+
+    record = build_polymarket_canonical_day_from_storage(
+        date=date,
+        series_key="btc-updown-5m",
+        outcomes=OutcomesMode.BOTH,
+        depth=5,
+        s3_store=store,
+        shard_repo=shard_repo,
+    )
+
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
+        payload = reader.read().decode("utf-8").strip().splitlines()
+
+    assert '"ListedCurrent"' in payload[0]
+    assert '"btc-updown-5m-1771459200"' in payload[0]
+    assert '"ListedNext"' in payload[1]
+    assert '"btc-updown-5m-1771459500"' in payload[1]
+
+
 def test_build_polymarket_canonical_day_filters_to_current_and_next_contracts() -> None:
     date = "2026-02-19"
     store = FakeS3Store()
@@ -893,7 +1033,7 @@ def test_sync_series_clips_market_dates_to_requested_window(monkeypatch) -> None
     )
     seen_backfill_dates: list[tuple[str, ...]] = []
     seen_normalize_dates: list[tuple[str, ...]] = []
-    built_dates: list[str] = []
+    built_dates: list[tuple[str, bool]] = []
 
     monkeypatch.setattr(
         polymarket_telonex,
@@ -907,8 +1047,8 @@ def test_sync_series_clips_market_dates_to_requested_window(monkeypatch) -> None
     def fake_normalize(*args, **kwargs):
         seen_normalize_dates.append(kwargs["resolution"].dates)
 
-    def fake_build(*, date, **kwargs):
-        built_dates.append(date)
+    def fake_build(*, date, force=False, **kwargs):
+        built_dates.append((date, force))
 
     monkeypatch.setattr(polymarket_telonex, "backfill_market", fake_backfill)
     monkeypatch.setattr(polymarket_telonex, "normalize_market", fake_normalize)
@@ -929,5 +1069,5 @@ def test_sync_series_clips_market_dates_to_requested_window(monkeypatch) -> None
 
     assert seen_backfill_dates == [("2026-02-19",)]
     assert seen_normalize_dates == [("2026-02-19",)]
-    assert built_dates == ["2026-02-19"]
+    assert built_dates == [("2026-02-19", True)]
     assert returned[0].dates == ("2026-02-19",)

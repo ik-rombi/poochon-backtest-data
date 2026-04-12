@@ -87,6 +87,7 @@ def main() -> None:
         default=OutcomesMode.BOTH.value,
     )
     polymarket_build_parser.add_argument("--depth", type=int, default=5)
+    polymarket_build_parser.add_argument("--force", action="store_true")
 
     args = parser.parse_args()
     settings = get_settings()
@@ -145,6 +146,7 @@ def main() -> None:
                 depth=args.depth,
                 s3_store=s3_store,
                 shard_repo=shard_repo,
+                force=args.force,
             )
         return
 
