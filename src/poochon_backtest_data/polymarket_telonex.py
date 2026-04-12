@@ -35,9 +35,12 @@ from .models import (
 from .storage import CanonicalShardRepository, CoverageRepository, S3Store
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+VATIC_BASE_URL = "https://api.vatic.trading"
+BINANCE_BASE_URL = "https://api.binance.com"
 TELONEX_DOWNLOAD_BASE_URL = "https://api.telonex.io/v1/downloads/polymarket"
 BOOK_CHANNEL = "book_snapshot_5"
 TRADE_CHANNEL = "trades"
+POLYMARKET_5M_INTERVAL_MS = 300_000
 
 BOOK_RAW_SCHEMA = pa.schema(
     [
@@ -102,14 +105,17 @@ class SeriesCandidate:
     outcomes: tuple[PolymarketMarketResolution, ...]
 
 
+@dataclass(frozen=True)
+class PriceToBeat:
+    price: float
+    source: str
+    quality: str
+
+
 def _parse_utc_timestamp(value: str) -> datetime:
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     return datetime.fromisoformat(value).astimezone(UTC)
-
-
-def _iso_to_epoch_ms(value: str) -> int:
-    return int(_parse_utc_timestamp(value).timestamp() * 1000)
 
 
 def _date_span(start: datetime, end: datetime) -> tuple[str, ...]:
@@ -133,15 +139,56 @@ def _parse_json_list(raw: str) -> list[str]:
     return [str(value) for value in values]
 
 
-def _resolution_from_payload(payload: dict[str, Any], outcome: str) -> PolymarketMarketResolution:
+def _series_key_from_slug(slug: str) -> str:
+    head, sep, tail = slug.rpartition("-")
+    if sep and len(tail) >= 8 and tail.isdigit():
+        return head
+    return slug
+
+
+def _window_bounds_from_slug(slug: str) -> tuple[int, int] | None:
+    head, sep, tail = slug.rpartition("-")
+    if not sep or len(tail) < 8 or not tail.isdigit():
+        return None
+    if "5m" not in head:
+        return None
+    start_ts_ms = int(tail) * 1000
+    return (start_ts_ms, start_ts_ms + POLYMARKET_5M_INTERVAL_MS)
+
+
+def _contract_window_from_payload(payload: dict[str, Any]) -> tuple[datetime, datetime, int, int]:
+    fallback_start = _parse_utc_timestamp(payload["startDate"])
+    fallback_end = _parse_utc_timestamp(payload["endDate"])
+    window = _window_bounds_from_slug(str(payload["slug"]))
+    if window is None:
+        return (
+            fallback_start,
+            fallback_end,
+            int(fallback_start.timestamp() * 1000),
+            int(fallback_end.timestamp() * 1000),
+        )
+    start_ts_ms, end_ts_ms = window
+    return (
+        datetime.fromtimestamp(start_ts_ms / 1000, tz=UTC),
+        datetime.fromtimestamp(end_ts_ms / 1000, tz=UTC),
+        start_ts_ms,
+        end_ts_ms,
+    )
+
+
+def _resolution_from_payload(
+    payload: dict[str, Any],
+    outcome: str,
+    *,
+    price_to_beat: PriceToBeat | None = None,
+) -> PolymarketMarketResolution:
     outcomes = _parse_json_list(payload["outcomes"])
     token_ids = _parse_json_list(payload["clobTokenIds"])
     if outcome not in outcomes:
         valid = ", ".join(f"'{value}'" for value in outcomes)
         raise ValueError(f"unknown outcome '{outcome}'. Valid outcomes: {valid}")
     outcome_index = outcomes.index(outcome)
-    start = _parse_utc_timestamp(payload["startDate"])
-    end = _parse_utc_timestamp(payload["endDate"])
+    start, end, start_ts_ms, end_ts_ms = _contract_window_from_payload(payload)
     instrument = f"{payload['slug']}:{outcome}"
     return PolymarketMarketResolution(
         slug=payload["slug"],
@@ -152,10 +199,98 @@ def _resolution_from_payload(payload: dict[str, Any], outcome: str) -> Polymarke
         instrument=instrument,
         start_time=start.isoformat(),
         end_time=end.isoformat(),
-        start_ts_ms=int(start.timestamp() * 1000),
-        end_ts_ms=int(end.timestamp() * 1000),
+        start_ts_ms=start_ts_ms,
+        end_ts_ms=end_ts_ms,
         dates=_date_span(start, end),
+        price_to_beat=None if price_to_beat is None else price_to_beat.price,
+        price_to_beat_source=None if price_to_beat is None else price_to_beat.source,
+        price_to_beat_quality=None if price_to_beat is None else price_to_beat.quality,
     )
+
+
+def _asset_from_series_key(series_key: str) -> str:
+    return series_key.split("-", 1)[0].lower()
+
+
+def _fetch_vatic_price_to_beat(
+    client: httpx.Client,
+    *,
+    asset: str,
+    start_ts_ms: int,
+) -> PriceToBeat | None:
+    timestamp = start_ts_ms // 1000
+    requests = [
+        client.get(
+            f"{VATIC_BASE_URL}/api/v1/targets/timestamp",
+            params={"asset": asset, "type": "5min", "timestamp": timestamp},
+        ),
+    ]
+    for response in requests:
+        if response.status_code >= 400:
+            continue
+        payload = response.json()
+        for key in ("target_price", "price"):
+            value = payload.get(key)
+            if value is not None:
+                return PriceToBeat(price=float(value), source="vatic", quality="exact")
+    response = client.get(
+        f"{VATIC_BASE_URL}/api/v1/targets/{timestamp}",
+        params={"asset": asset, "type": "5min"},
+    )
+    if response.status_code < 400:
+        payload = response.json()
+        for key in ("target_price", "price"):
+            value = payload.get(key)
+            if value is not None:
+                return PriceToBeat(price=float(value), source="vatic", quality="exact")
+    return None
+
+
+def _fetch_binance_price_to_beat(
+    client: httpx.Client,
+    *,
+    asset: str,
+    start_ts_ms: int,
+) -> PriceToBeat | None:
+    response = client.get(
+        f"{BINANCE_BASE_URL}/api/v3/klines",
+        params={
+            "symbol": f"{asset.upper()}USDT",
+            "interval": "1m",
+            "startTime": start_ts_ms,
+            "limit": 1,
+        },
+    )
+    if response.status_code >= 400:
+        return None
+    payload = response.json()
+    if not payload:
+        return None
+    first = payload[0]
+    if len(first) < 2:
+        return None
+    return PriceToBeat(price=float(first[1]), source="binance_open_1m", quality="proxy")
+
+
+def _fetch_price_to_beat(
+    client: httpx.Client,
+    *,
+    slug: str,
+    start_ts_ms: int,
+) -> PriceToBeat | None:
+    series_key = _series_key_from_slug(slug)
+    if "5m" not in series_key:
+        return None
+    asset = _asset_from_series_key(series_key)
+    try:
+        if exact := _fetch_vatic_price_to_beat(client, asset=asset, start_ts_ms=start_ts_ms):
+            return exact
+    except (httpx.HTTPError, ValueError):
+        pass
+    try:
+        return _fetch_binance_price_to_beat(client, asset=asset, start_ts_ms=start_ts_ms)
+    except (httpx.HTTPError, ValueError):
+        return None
 
 
 def resolve_market(
@@ -169,10 +304,16 @@ def resolve_market(
         response = http.get(f"{GAMMA_BASE_URL}/markets/slug/{request.slug}")
         response.raise_for_status()
         payload = response.json()
+        _, _, start_ts_ms, _ = _contract_window_from_payload(payload)
+        price_to_beat = _fetch_price_to_beat(
+            http,
+            slug=str(payload["slug"]),
+            start_ts_ms=start_ts_ms,
+        )
     finally:
         if own_client:
             http.close()
-    return _resolution_from_payload(payload, request.outcome)
+    return _resolution_from_payload(payload, request.outcome, price_to_beat=price_to_beat)
 
 
 def _put_coverage(
@@ -543,12 +684,20 @@ def discover_series_markets(
                 continue
             response.raise_for_status()
             payload = response.json()
-            start = _parse_utc_timestamp(payload["startDate"])
-            end = _parse_utc_timestamp(payload["endDate"])
+            start, end, start_ts_ms, _ = _contract_window_from_payload(payload)
             if end < window_start or start > window_end:
                 continue
+            price_to_beat = _fetch_price_to_beat(
+                http,
+                slug=str(payload["slug"]),
+                start_ts_ms=start_ts_ms,
+            )
             for outcome in ("Up", "Down"):
-                resolution = _resolution_from_payload(payload, outcome)
+                resolution = _resolution_from_payload(
+                    payload,
+                    outcome,
+                    price_to_beat=price_to_beat,
+                )
                 key = (resolution.slug, resolution.outcome)
                 if key in seen:
                     continue

@@ -269,6 +269,9 @@ class PolymarketMarketResolution(BaseModel):
     start_ts_ms: int
     end_ts_ms: int
     dates: tuple[str, ...]
+    price_to_beat: float | None = None
+    price_to_beat_source: str | None = None
+    price_to_beat_quality: str | None = None
 
     @model_validator(mode="after")
     def validate_resolution(self) -> "PolymarketMarketResolution":
@@ -286,6 +289,13 @@ class PolymarketMarketResolution(BaseModel):
             market_type=self.market_type,
             instrument=self.instrument,
         )
+
+    @property
+    def series_key(self) -> str:
+        head, sep, tail = self.slug.rpartition("-")
+        if sep and tail.isdigit():
+            return head
+        return self.slug
 
     def replay_request(self, *, depth: int) -> ReplayRequest:
         return ReplayRequest(
