@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import orjson
 import zstandard
 
@@ -13,6 +14,7 @@ import poochon_backtest_data.polymarket_telonex as polymarket_telonex
 from poochon_backtest_data.canonical import (
     build_polymarket_canonical_day,
     build_polymarket_canonical_day_from_storage,
+    validate_polymarket_current_next_file,
 )
 from poochon_backtest_data.models import (
     CanonicalShardRecord,
@@ -87,6 +89,14 @@ def parquet_bytes(rows: list[dict], schema: pa.Schema) -> bytes:
     buffer = io.BytesIO()
     pq.write_table(table, buffer, compression="zstd")
     return buffer.getvalue()
+
+
+def write_jsonl_zst(path: Path, rows: list[dict]) -> None:
+    with path.open("wb") as raw_file:
+        with zstandard.ZstdCompressor(level=1).stream_writer(raw_file) as writer:
+            for row in rows:
+                writer.write(orjson.dumps(row))
+                writer.write(b"\n")
 
 
 def market_payload(
@@ -546,10 +556,20 @@ def test_build_polymarket_canonical_day_merges_both_outcomes() -> None:
 
     with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
         payload = reader.read().decode("utf-8").strip().splitlines()
+    first = orjson.loads(payload[0])
+    second = orjson.loads(payload[1])
     assert len(payload) == 5
-    assert '"Contract"' in payload[0]
-    assert '"ListedCurrent"' in payload[0]
-    assert '"Trade"' in payload[1]
+    assert first["Contract"]["Polymarket"]["kind"] == "ListedCurrent"
+    assert first["Contract"]["Polymarket"]["outcomes"][0]["instrument"] == {
+        "Polymarket": {"symbol": "btc-updown-5m-1:Down"}
+    }
+    assert first["Contract"]["Polymarket"]["outcomes"][1]["instrument"] == {
+        "Polymarket": {"symbol": "btc-updown-5m-1:Up"}
+    }
+    assert second["Market"]["Trade"]["instrument"] in (
+        {"Polymarket": {"symbol": "btc-updown-5m-1:Down"}},
+        {"Polymarket": {"symbol": "btc-updown-5m-1:Up"}},
+    )
     assert any('"btc-updown-5m-1:Up"' in line for line in payload)
     assert any('"btc-updown-5m-1:Down"' in line for line in payload)
 
@@ -662,8 +682,14 @@ def test_build_polymarket_canonical_day_from_storage_scans_normalized_objects() 
 
     with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
         payload = reader.read().decode("utf-8").strip().splitlines()
+    first = orjson.loads(payload[0])
+    second = orjson.loads(payload[1])
     assert len(payload) == 5
-    assert '"Contract"' in payload[0]
+    assert first["Contract"]["Polymarket"]["kind"] == "ListedCurrent"
+    assert second["Market"]["Trade"]["instrument"] in (
+        {"Polymarket": {"symbol": "btc-updown-5m-1:Down"}},
+        {"Polymarket": {"symbol": "btc-updown-5m-1:Up"}},
+    )
     assert any('"btc-updown-5m-1:Up"' in line for line in payload)
     assert any('"btc-updown-5m-1:Down"' in line for line in payload)
 
@@ -779,11 +805,13 @@ def test_build_polymarket_canonical_day_from_storage_emits_listed_next_for_adjac
 
     with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
         payload = reader.read().decode("utf-8").strip().splitlines()
+    first = orjson.loads(payload[0])
+    second = orjson.loads(payload[1])
 
-    assert '"ListedCurrent"' in payload[0]
-    assert '"btc-updown-5m-1771459200"' in payload[0]
-    assert '"ListedNext"' in payload[1]
-    assert '"btc-updown-5m-1771459500"' in payload[1]
+    assert first["Contract"]["Polymarket"]["kind"] == "ListedCurrent"
+    assert first["Contract"]["Polymarket"]["slug"] == "btc-updown-5m-1771459200"
+    assert second["Contract"]["Polymarket"]["kind"] == "ListedNext"
+    assert second["Contract"]["Polymarket"]["slug"] == "btc-updown-5m-1771459500"
 
 
 def test_build_polymarket_canonical_day_filters_to_current_and_next_contracts() -> None:
@@ -903,6 +931,256 @@ def test_build_polymarket_canonical_day_filters_to_current_and_next_contracts() 
     assert "btc-updown-5m-1771459500:Up" in payload
     assert "btc-updown-5m-1771459800:Up" not in payload
     assert "\"px\":0.99" not in payload
+
+
+def test_build_polymarket_canonical_day_rolls_forward_to_new_current_and_next() -> None:
+    date = "2026-02-19"
+    store = FakeS3Store()
+    coverage = FakeCoverageRepository()
+    shard_repo = FakeShardRepository()
+
+    l2_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("bids_json", pa.large_string()),
+            ("asks_json", pa.large_string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+    trade_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("side", pa.string()),
+            ("px", pa.float64()),
+            ("sz", pa.float64()),
+            ("hash", pa.string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+
+    resolutions = [
+        PolymarketMarketResolution(
+            slug=f"btc-updown-5m-{start}",
+            question="q",
+            outcome=outcome,
+            market_id=f"0x{start}",
+            asset_id=f"asset-{start}-{outcome.lower()}",
+            instrument=f"btc-updown-5m-{start}:{outcome}",
+            start_time="2026-02-19T00:00:00+00:00",
+            end_time="2026-02-19T00:05:00+00:00",
+            start_ts_ms=start * 1000,
+            end_ts_ms=(start + 300) * 1000,
+            dates=(date,),
+            price_to_beat=66000.0,
+            price_to_beat_source="vatic",
+            price_to_beat_quality="exact",
+        )
+        for start in (1771459200, 1771459500, 1771459800)
+        for outcome in ("Up", "Down")
+    ]
+
+    for resolution in resolutions:
+        market = resolution.market_ref()
+        coverage.put(ready_coverage(DatasetKind.NORMALIZED_L2, resolution, date))
+        coverage.put(ready_coverage(DatasetKind.NORMALIZED_TRADES, resolution, date))
+        if resolution.slug == "btc-updown-5m-1771459200":
+            ts_ms = 1771459210000
+        else:
+            ts_ms = 1771459501000
+        store.objects[polymarket_normalized_trade_s3_key(market, resolution.market_id, date)] = parquet_bytes(
+            [
+                {
+                    "ts_ms": ts_ms,
+                    "instrument": resolution.instrument,
+                    "side": "Buy",
+                    "px": 0.5,
+                    "sz": 10.0,
+                    "hash": f"hash-{resolution.slug}-{resolution.outcome}",
+                    "source_hour": 0,
+                    "source_line_number": 1,
+                }
+            ],
+            trade_schema,
+        )
+        store.objects[polymarket_normalized_l2_s3_key(market, resolution.market_id, date)] = parquet_bytes(
+            [
+                {
+                    "ts_ms": ts_ms,
+                    "instrument": resolution.instrument,
+                    "bids_json": '[{"px":"0.49","sz":"10","n":0}]',
+                    "asks_json": '[{"px":"0.51","sz":"11","n":0}]',
+                    "source_hour": 0,
+                    "source_line_number": 2,
+                }
+            ],
+            l2_schema,
+        )
+
+    record = build_polymarket_canonical_day(
+        date=date,
+        series_key="btc-updown-5m",
+        outcomes=OutcomesMode.BOTH,
+        depth=5,
+        resolutions=resolutions,
+        s3_store=store,
+        coverage_repo=coverage,
+        shard_repo=shard_repo,
+    )
+
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
+        payload = reader.read().decode("utf-8").strip().splitlines()
+
+    contract_rows = [
+        orjson.loads(line)["Contract"]["Polymarket"]
+        for line in payload
+        if '"Contract"' in line
+    ]
+
+    assert [(row["kind"], row["slug"]) for row in contract_rows] == [
+        ("ListedCurrent", "btc-updown-5m-1771459200"),
+        ("ListedNext", "btc-updown-5m-1771459500"),
+        ("Resolved", "btc-updown-5m-1771459200"),
+        ("Activated", "btc-updown-5m-1771459500"),
+        ("ListedNext", "btc-updown-5m-1771459800"),
+    ]
+    assert "btc-updown-5m-1771459800:Up" in "\n".join(payload)
+
+
+def test_validate_polymarket_current_next_file_accepts_current_next_rollover(tmp_path: Path) -> None:
+    path = tmp_path / "polymarket.jsonl.zst"
+    write_jsonl_zst(
+        path,
+        [
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "ListedCurrent",
+                        "ts_ms": 1771459200000,
+                        "slug": "btc-updown-5m-1771459200",
+                    }
+                }
+            },
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "ListedNext",
+                        "ts_ms": 1771459200000,
+                        "slug": "btc-updown-5m-1771459500",
+                    }
+                }
+            },
+            {
+                "Market": {
+                    "L2Snapshot": {
+                        "instrument": {"Polymarket": {"symbol": "btc-updown-5m-1771459200:Up"}},
+                        "ts_ms": 1771459200001,
+                    }
+                }
+            },
+            {
+                "Market": {
+                    "L2Snapshot": {
+                        "instrument": {"Polymarket": {"symbol": "btc-updown-5m-1771459500:Down"}},
+                        "ts_ms": 1771459200001,
+                    }
+                }
+            },
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "Resolved",
+                        "ts_ms": 1771459500002,
+                        "slug": "btc-updown-5m-1771459200",
+                    }
+                }
+            },
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "Activated",
+                        "ts_ms": 1771459500002,
+                        "slug": "btc-updown-5m-1771459500",
+                    }
+                }
+            },
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "ListedNext",
+                        "ts_ms": 1771459500002,
+                        "slug": "btc-updown-5m-1771459800",
+                    }
+                }
+            },
+            {
+                "Market": {
+                    "Trade": {
+                        "instrument": {"Polymarket": {"symbol": "btc-updown-5m-1771459500:Up"}},
+                        "ts_ms": 1771459500003,
+                    }
+                }
+            },
+            {
+                "Market": {
+                    "Trade": {
+                        "instrument": {"Polymarket": {"symbol": "btc-updown-5m-1771459800:Down"}},
+                        "ts_ms": 1771459500003,
+                    }
+                }
+            },
+        ],
+    )
+
+    summary = validate_polymarket_current_next_file(path)
+
+    assert summary.market_rows == 4
+    assert summary.contract_rows == 5
+    assert summary.max_market_slugs_per_ts == 2
+    assert summary.max_contract_slugs_per_ts == 3
+    assert summary.final_current_slug == "btc-updown-5m-1771459500"
+    assert summary.final_next_slug == "btc-updown-5m-1771459800"
+
+
+def test_validate_polymarket_current_next_file_rejects_market_row_for_third_slug(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-polymarket.jsonl.zst"
+    write_jsonl_zst(
+        path,
+        [
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "ListedCurrent",
+                        "ts_ms": 1771459200000,
+                        "slug": "btc-updown-5m-1771459200",
+                    }
+                }
+            },
+            {
+                "Contract": {
+                    "Polymarket": {
+                        "kind": "ListedNext",
+                        "ts_ms": 1771459200000,
+                        "slug": "btc-updown-5m-1771459500",
+                    }
+                }
+            },
+            {
+                "Market": {
+                    "Trade": {
+                        "instrument": {"Polymarket": {"symbol": "btc-updown-5m-1771459800:Up"}},
+                        "ts_ms": 1771459200001,
+                    }
+                }
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="active current/next"):
+        validate_polymarket_current_next_file(path)
 
 
 def test_build_polymarket_canonical_day_from_storage_falls_back_without_metadata() -> None:

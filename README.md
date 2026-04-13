@@ -260,7 +260,9 @@ There are three event envelopes today.
 {
   "Market": {
     "Trade": {
-      "instrument": { "venue": "Polymarket", "symbol": "btc-updown-5m-1771459200:Up" },
+      "instrument": {
+        "Polymarket": { "symbol": "btc-updown-5m-1771459200:Up" }
+      },
       "ts_ms": 1771459201234,
       "px": 0.5,
       "sz": 10.0,
@@ -276,7 +278,9 @@ There are three event envelopes today.
 {
   "Market": {
     "L2Snapshot": {
-      "instrument": { "venue": "Polymarket", "symbol": "btc-updown-5m-1771459200:Up" },
+      "instrument": {
+        "Polymarket": { "symbol": "btc-updown-5m-1771459200:Up" }
+      },
       "ts_ms": 1771459201234,
       "bids": [{ "px": 0.49, "sz": 10.0, "level_count": 0 }],
       "asks": [{ "px": 0.51, "sz": 11.0, "level_count": 0 }]
@@ -307,12 +311,16 @@ There are three event envelopes today.
         {
           "outcome": "Down",
           "asset_id": "8059...",
-          "instrument": { "venue": "Polymarket", "symbol": "btc-updown-5m-1771459200:Down" }
+          "instrument": {
+            "Polymarket": { "symbol": "btc-updown-5m-1771459200:Down" }
+          }
         },
         {
           "outcome": "Up",
           "asset_id": "9936...",
-          "instrument": { "venue": "Polymarket", "symbol": "btc-updown-5m-1771459200:Up" }
+          "instrument": {
+            "Polymarket": { "symbol": "btc-updown-5m-1771459200:Up" }
+          }
         }
       ]
     }
@@ -404,6 +412,18 @@ uv run poochon-backtest-data hyperliquid-sync-window \
   --start-date 2026-02-19 \
   --end-date 2026-02-21 \
   --depth 20
+```
+
+If normalized Hyperliquid inputs already exist and only canonical output is stale, rebuild only the canonical stage:
+
+```bash
+uv run poochon-backtest-data hyperliquid-build-canonical-window \
+  --market-type perp \
+  --instrument BTC \
+  --start-date 2026-02-19 \
+  --end-date 2026-02-21 \
+  --depth 20 \
+  --force
 ```
 
 ### Runtime Stack Lifecycle

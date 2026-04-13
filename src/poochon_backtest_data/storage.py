@@ -6,11 +6,14 @@ import json
 from typing import Any, Iterator
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 import orjson
 import zstandard
 
 from .models import CanonicalShardRecord, CoverageRecord, ReplayRecord
+
+S3_CLIENT_CONFIG = Config(max_pool_connections=64)
 
 
 def boto3_session(region: str):
@@ -21,7 +24,7 @@ class S3Store:
     def __init__(self, session: boto3.session.Session, bucket: str):
         self.region = session.region_name or "eu-west-1"
         self.bucket = bucket
-        self.client = session.client("s3")
+        self.client = session.client("s3", config=S3_CLIENT_CONFIG)
 
     def clone(self) -> "S3Store":
         return S3Store(boto3_session(self.region), self.bucket)

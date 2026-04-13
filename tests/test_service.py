@@ -67,7 +67,22 @@ def test_canonical_replay_service_loads_shards_and_streams() -> None:
     )
     s3 = FakeS3Store()
     s3.objects["canonical/hyperliquid/one"] = zstd_bytes(
-        {"Market": {"Trade": {"instrument": {"venue": "Hyperliquid", "symbol": "BTC"}, "ts_ms": 1, "px": 1.0, "sz": 1.0, "side": "Buy"}}}
+        {
+            "Market": {
+                "Trade": {
+                    "instrument": {
+                        "Hyperliquid": {
+                            "market_type": "Perp",
+                            "symbol": "BTC",
+                        }
+                    },
+                    "ts_ms": 1,
+                    "px": 1.0,
+                    "sz": 1.0,
+                    "side": "Buy",
+                }
+            }
+        }
     )
     service = CanonicalReplayService(
         s3_store=s3,

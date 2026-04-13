@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, date as date_cls, datetime
 import heapq
 import io
-import shutil
-import tempfile
+import logging
+from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Iterator
 from urllib.parse import unquote
 
@@ -39,21 +41,48 @@ from .models import (
 )
 from .storage import CanonicalShardRepository, CoverageRepository, S3Store
 
+logger = logging.getLogger(__name__)
 
-def _venue_label(venue: Venue) -> str:
-    if venue == Venue.HYPERLIQUID:
-        return "Hyperliquid"
-    if venue == Venue.POLYMARKET:
-        return "Polymarket"
-    return str(venue)
+
+def _hyperliquid_market_type_variant(value: str | MarketType) -> str:
+    market_type = value if isinstance(value, MarketType) else MarketType(value)
+    if market_type == MarketType.PERP:
+        return "Perp"
+    if market_type == MarketType.SPOT:
+        return "Spot"
+    raise ValueError(f"unsupported hyperliquid market type for strategy event: {market_type}")
+
+
+def _instrument_payload(
+    *,
+    venue: str | Venue,
+    instrument: str,
+    market_type: str | MarketType | None = None,
+) -> dict[str, Any]:
+    venue_value = venue if isinstance(venue, Venue) else Venue(venue)
+    if venue_value == Venue.HYPERLIQUID:
+        if market_type is None:
+            raise ValueError("hyperliquid strategy events require market_type")
+        return {
+            "Hyperliquid": {
+                "market_type": _hyperliquid_market_type_variant(market_type),
+                "symbol": instrument,
+            }
+        }
+    if venue_value == Venue.POLYMARKET:
+        return {"Polymarket": {"symbol": instrument}}
+    raise ValueError(f"unsupported venue for strategy event instrument: {venue_value}")
 
 
 def _trade_event(row: dict[str, Any]) -> dict[str, Any]:
-    venue = str(row["venue_label"])
     return {
         "Market": {
             "Trade": {
-                "instrument": {"venue": venue, "symbol": row["instrument"]},
+                "instrument": _instrument_payload(
+                    venue=row["canonical_venue"],
+                    instrument=str(row["instrument"]),
+                    market_type=row.get("canonical_market_type"),
+                ),
                 "ts_ms": int(row["ts_ms"]),
                 "px": float(row["px"]),
                 "sz": float(row["sz"]),
@@ -64,8 +93,6 @@ def _trade_event(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _snapshot_event(row: dict[str, Any], *, depth: int) -> dict[str, Any]:
-    venue = str(row["venue_label"])
-
     def decode_levels(raw_levels: str) -> list[dict[str, Any]]:
         return [
             {
@@ -79,7 +106,11 @@ def _snapshot_event(row: dict[str, Any], *, depth: int) -> dict[str, Any]:
     return {
         "Market": {
             "L2Snapshot": {
-                "instrument": {"venue": venue, "symbol": row["instrument"]},
+                "instrument": _instrument_payload(
+                    venue=row["canonical_venue"],
+                    instrument=str(row["instrument"]),
+                    market_type=row.get("canonical_market_type"),
+                ),
                 "ts_ms": int(row["ts_ms"]),
                 "bids": decode_levels(row["bids_json"]),
                 "asks": decode_levels(row["asks_json"]),
@@ -130,6 +161,48 @@ class _MergedRow:
 
 
 @dataclass(frozen=True)
+class _PolymarketResolutionSource:
+    resolution: PolymarketMarketResolution
+    trade_key: str | None
+    l2_key: str | None
+
+
+@dataclass(frozen=True)
+class _PolymarketWindow:
+    current: _PolymarketContract
+    next_contract: _PolymarketContract | None
+    start_ts_ms: int
+    end_ts_exclusive_ms: int
+    sources: tuple[_PolymarketResolutionSource, ...]
+
+
+@dataclass
+class _PolymarketBuildStats:
+    contracts_discovered: int = 0
+    windows_planned: int = 0
+    objects_fetched: int = 0
+    bytes_fetched: int = 0
+    rows_emitted: int = 0
+    fetch_seconds: float = 0.0
+    emit_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class PolymarketCanonicalValidationSummary:
+    path: str
+    total_rows: int
+    market_rows: int
+    contract_rows: int
+    timestamps_seen: int
+    market_timestamps_seen: int
+    contract_timestamps_seen: int
+    max_market_slugs_per_ts: int
+    max_contract_slugs_per_ts: int
+    final_current_slug: str | None
+    final_next_slug: str | None
+
+
+@dataclass(frozen=True)
 class _PolymarketContractOutcome:
     outcome: str
     asset_id: str
@@ -166,7 +239,10 @@ class _PolymarketContract:
                         {
                             "outcome": item.outcome,
                             "asset_id": item.asset_id,
-                            "instrument": {"venue": "Polymarket", "symbol": item.instrument},
+                            "instrument": _instrument_payload(
+                                venue=Venue.POLYMARKET,
+                                instrument=item.instrument,
+                            ),
                         }
                         for item in self.outcomes
                     ],
@@ -270,18 +346,61 @@ def _group_polymarket_contracts(
     return contracts
 
 
-def _polymarket_row_allowed(
-    schedule: _PolymarketContractSchedule,
+def _polymarket_day_bounds_ms(date: str) -> tuple[int, int]:
+    day = date_cls.fromisoformat(date)
+    start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    end = datetime.fromtimestamp(start.timestamp(), tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts_ms = int(start.timestamp() * 1000)
+    return start_ts_ms, start_ts_ms + 86_400_000
+
+
+def _sort_resolution_sources(
+    sources: list[_PolymarketResolutionSource],
+) -> list[_PolymarketResolutionSource]:
+    return sorted(
+        sources,
+        key=lambda item: (
+            item.resolution.start_ts_ms,
+            item.resolution.slug,
+            item.resolution.outcome,
+        ),
+    )
+
+
+def _plan_polymarket_windows(
     *,
-    slug: str,
-    ts_ms: int,
-) -> bool:
-    current, next_contract = schedule.current_and_next_for_ts(ts_ms)
-    if current is None:
-        return False
-    if current.slug == slug:
-        return True
-    return next_contract is not None and next_contract.slug == slug
+    date: str,
+    schedule: _PolymarketContractSchedule,
+    sources_by_slug: dict[str, list[_PolymarketResolutionSource]],
+) -> list[_PolymarketWindow]:
+    day_start_ts_ms, day_end_ts_exclusive_ms = _polymarket_day_bounds_ms(date)
+    windows: list[_PolymarketWindow] = []
+
+    for current in schedule.contracts:
+        next_contract = schedule.by_start.get(current.start_ts_ms + schedule.interval_ms)
+        window_start_ts_ms = max(day_start_ts_ms, current.start_ts_ms)
+        natural_end_ts_exclusive_ms = (
+            next_contract.start_ts_ms if next_contract is not None else current.end_ts_ms + 1
+        )
+        window_end_ts_exclusive_ms = min(day_end_ts_exclusive_ms, natural_end_ts_exclusive_ms)
+        if window_start_ts_ms >= window_end_ts_exclusive_ms:
+            continue
+
+        selected_sources = _sort_resolution_sources(sources_by_slug.get(current.slug, []))
+        if next_contract is not None:
+            selected_sources.extend(_sort_resolution_sources(sources_by_slug.get(next_contract.slug, [])))
+
+        windows.append(
+            _PolymarketWindow(
+                current=current,
+                next_contract=next_contract,
+                start_ts_ms=window_start_ts_ms,
+                end_ts_exclusive_ms=window_end_ts_exclusive_ms,
+                sources=tuple(selected_sources),
+            )
+        )
+
+    return windows
 
 
 def _stream_sort_key(row: dict[str, Any], kind: str, source_order: int) -> tuple[int, int, int, int]:
@@ -317,71 +436,280 @@ def _merge_sorted_streams(streams: list[_MergeStream]) -> Iterator[_MergedRow]:
         )
 
 
-def _chunked[T](items: list[T], chunk_size: int) -> Iterator[list[T]]:
-    for start in range(0, len(items), chunk_size):
-        yield items[start : start + chunk_size]
+def _open_jsonl_reader(path: str | Path) -> Iterator[str]:
+    file_path = Path(path)
+    with file_path.open("rb") as raw_file:
+        if file_path.suffix == ".zst":
+            with zstandard.ZstdDecompressor().stream_reader(raw_file) as reader:
+                with io.TextIOWrapper(reader, encoding="utf-8") as text_reader:
+                    yield from text_reader
+            return
+        with io.TextIOWrapper(raw_file, encoding="utf-8") as text_reader:
+            yield from text_reader
 
 
-def _fragment_payload(merged: _MergedRow) -> bytes:
-    return orjson.dumps(
-        {
-            "kind": merged.kind,
-            "source_order": merged.source_order,
-            "row": merged.row,
-        }
-    )
+def _polymarket_slug_start_secs(slug: str) -> int:
+    try:
+        _, timestamp = slug.rsplit("-", 1)
+        return int(timestamp)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid polymarket slug: {slug}") from exc
 
 
-def _write_fragment(path: str, streams: list[_MergeStream]) -> None:
-    with open(path, "wb") as handle:
-        for merged in _merge_sorted_streams(streams):
-            handle.write(_fragment_payload(merged))
-            handle.write(b"\n")
-
-
-def _iter_fragment_rows(path: str) -> Iterator[_MergedRow]:
-    with open(path, "rb") as handle:
-        for line in handle:
-            payload = orjson.loads(line)
-            yield _MergedRow(
-                kind=str(payload["kind"]),
-                source_order=int(payload["source_order"]),
-                row=payload["row"],
+def _validate_polymarket_slug_sequence(
+    *,
+    ts_ms: int,
+    slugs: set[str],
+    limit: int,
+    context: str,
+) -> None:
+    if len(slugs) > limit:
+        ordered = sorted(slugs, key=_polymarket_slug_start_secs)
+        raise ValueError(
+            f"{context} at ts_ms={ts_ms} exposed {len(slugs)} slugs; expected at most {limit}: {ordered}"
+        )
+    ordered_starts = sorted(_polymarket_slug_start_secs(slug) for slug in slugs)
+    for previous, current in zip(ordered_starts, ordered_starts[1:]):
+        if current - previous != 300:
+            raise ValueError(
+                f"{context} at ts_ms={ts_ms} exposed non-adjacent slugs: {sorted(slugs)}"
             )
 
 
-def _merge_fragment_files(paths: list[str]) -> Iterator[_MergedRow]:
-    iterators = [_iter_fragment_rows(path) for path in paths]
-    heap: list[tuple[tuple[int, int, int, int], int, _MergedRow]] = []
-    for index, iterator in enumerate(iterators):
-        try:
-            merged = next(iterator)
-        except StopIteration:
+def validate_polymarket_current_next_file(
+    path: str | Path,
+) -> PolymarketCanonicalValidationSummary:
+    current_slug: str | None = None
+    next_slug: str | None = None
+    current_ts_ms: int | None = None
+    timestamps_seen = 0
+    market_timestamps_seen = 0
+    contract_timestamps_seen = 0
+    total_rows = 0
+    market_rows = 0
+    contract_rows = 0
+    max_market_slugs_per_ts = 0
+    max_contract_slugs_per_ts = 0
+    market_slugs_at_ts: set[str] = set()
+    contract_slugs_at_ts: set[str] = set()
+    saw_market_at_ts = False
+    saw_contract_at_ts = False
+
+    def flush_timestamp() -> None:
+        nonlocal market_timestamps_seen, contract_timestamps_seen
+        nonlocal max_market_slugs_per_ts, max_contract_slugs_per_ts
+        nonlocal market_slugs_at_ts, contract_slugs_at_ts, saw_market_at_ts, saw_contract_at_ts
+        nonlocal current_ts_ms
+        if current_ts_ms is None:
+            return
+        _validate_polymarket_slug_sequence(
+            ts_ms=current_ts_ms,
+            slugs=market_slugs_at_ts,
+            limit=2,
+            context="market rows",
+        )
+        _validate_polymarket_slug_sequence(
+            ts_ms=current_ts_ms,
+            slugs=contract_slugs_at_ts,
+            limit=3,
+            context="contract rows",
+        )
+        if saw_market_at_ts:
+            market_timestamps_seen += 1
+            max_market_slugs_per_ts = max(max_market_slugs_per_ts, len(market_slugs_at_ts))
+        if saw_contract_at_ts:
+            contract_timestamps_seen += 1
+            max_contract_slugs_per_ts = max(max_contract_slugs_per_ts, len(contract_slugs_at_ts))
+        market_slugs_at_ts = set()
+        contract_slugs_at_ts = set()
+        saw_market_at_ts = False
+        saw_contract_at_ts = False
+
+    for line in _open_jsonl_reader(path):
+        line = line.strip()
+        if not line:
             continue
-        heapq.heappush(
-            heap,
-            (_stream_sort_key(merged.row, merged.kind, merged.source_order), index, merged),
+        payload = orjson.loads(line)
+        total_rows += 1
+        if "Contract" in payload and "Polymarket" in payload["Contract"]:
+            contract = payload["Contract"]["Polymarket"]
+            ts_ms = int(contract["ts_ms"])
+            if current_ts_ms is None:
+                current_ts_ms = ts_ms
+                timestamps_seen += 1
+            elif ts_ms != current_ts_ms:
+                flush_timestamp()
+                current_ts_ms = ts_ms
+                timestamps_seen += 1
+
+            saw_contract_at_ts = True
+            contract_rows += 1
+            slug = str(contract["slug"])
+            kind = str(contract["kind"])
+            contract_slugs_at_ts.add(slug)
+            if kind == "ListedCurrent":
+                current_slug = slug
+            elif kind == "ListedNext":
+                next_slug = slug
+            elif kind == "Resolved":
+                if current_slug is not None and slug != current_slug:
+                    raise ValueError(
+                        f"resolved slug mismatch at ts_ms={ts_ms}: expected current={current_slug}, got={slug}"
+                    )
+            elif kind == "Activated":
+                if next_slug is not None and slug != next_slug:
+                    raise ValueError(
+                        f"activated slug mismatch at ts_ms={ts_ms}: expected next={next_slug}, got={slug}"
+                    )
+                current_slug = slug
+                next_slug = None
+            else:
+                raise ValueError(f"unsupported contract kind at ts_ms={ts_ms}: {kind}")
+            continue
+
+        market = payload.get("Market")
+        if not isinstance(market, dict):
+            continue
+        event = next(iter(market.values()))
+        instrument = event.get("instrument")
+        if not isinstance(instrument, dict) or "Polymarket" not in instrument:
+            continue
+        symbol = instrument["Polymarket"].get("symbol")
+        if not isinstance(symbol, str):
+            continue
+        slug, separator, _ = symbol.rpartition(":")
+        if not separator:
+            raise ValueError(f"invalid polymarket instrument symbol: {symbol}")
+        ts_ms = int(event["ts_ms"])
+        if current_ts_ms is None:
+            current_ts_ms = ts_ms
+            timestamps_seen += 1
+        elif ts_ms != current_ts_ms:
+            flush_timestamp()
+            current_ts_ms = ts_ms
+            timestamps_seen += 1
+
+        if current_slug is None:
+            raise ValueError(f"market row encountered before ListedCurrent at ts_ms={ts_ms}: {symbol}")
+        allowed_slugs = {current_slug}
+        if next_slug is not None:
+            allowed_slugs.add(next_slug)
+        if slug not in allowed_slugs:
+            raise ValueError(
+                f"market row at ts_ms={ts_ms} referenced {slug}; active current/next={sorted(allowed_slugs)}"
+            )
+        saw_market_at_ts = True
+        market_rows += 1
+        market_slugs_at_ts.add(slug)
+
+    flush_timestamp()
+    return PolymarketCanonicalValidationSummary(
+        path=str(path),
+        total_rows=total_rows,
+        market_rows=market_rows,
+        contract_rows=contract_rows,
+        timestamps_seen=timestamps_seen,
+        market_timestamps_seen=market_timestamps_seen,
+        contract_timestamps_seen=contract_timestamps_seen,
+        max_market_slugs_per_ts=max_market_slugs_per_ts,
+        max_contract_slugs_per_ts=max_contract_slugs_per_ts,
+        final_current_slug=current_slug,
+        final_next_slug=next_slug,
+    )
+
+
+def _collect_polymarket_source_refs(windows: list[_PolymarketWindow]) -> list[str]:
+    seen: set[str] = set()
+    refs: list[str] = []
+    for window in windows:
+        for source in window.sources:
+            for key in (source.trade_key, source.l2_key):
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                refs.append(key)
+    return refs
+
+
+def _prefetch_polymarket_payloads(
+    *,
+    keys: list[str],
+    s3_store: S3Store,
+    payload_cache: dict[str, bytes],
+    stats: _PolymarketBuildStats,
+) -> None:
+    missing_keys = [key for key in keys if key not in payload_cache]
+    if not missing_keys:
+        return
+
+    fetch_started_at = perf_counter()
+    with ThreadPoolExecutor(max_workers=min(8, len(missing_keys))) as executor:
+        future_map = {executor.submit(s3_store.get_bytes, key): key for key in missing_keys}
+        for future in as_completed(future_map):
+            key = future_map[future]
+            payload = future.result()
+            payload_cache[key] = payload
+            stats.objects_fetched += 1
+            stats.bytes_fetched += len(payload)
+    stats.fetch_seconds += perf_counter() - fetch_started_at
+
+
+def _iter_polymarket_window_rows(
+    *,
+    windows: list[_PolymarketWindow],
+    s3_store: S3Store,
+    stats: _PolymarketBuildStats,
+) -> Iterator[_MergedRow]:
+    payload_cache: dict[str, bytes] = {}
+
+    for window in windows:
+        stream_specs: list[tuple[str, str]] = []
+        for source in window.sources:
+            if source.trade_key is not None:
+                stream_specs.append(("trade", source.trade_key))
+            if source.l2_key is not None:
+                stream_specs.append(("l2", source.l2_key))
+        if not stream_specs:
+            continue
+
+        ordered_keys = list(dict.fromkeys(key for _, key in stream_specs))
+        _prefetch_polymarket_payloads(
+            keys=ordered_keys,
+            s3_store=s3_store,
+            payload_cache=payload_cache,
+            stats=stats,
         )
 
-    while heap:
-        _, iterator_index, merged = heapq.heappop(heap)
-        yield merged
-        iterator = iterators[iterator_index]
-        try:
-            next_merged = next(iterator)
-        except StopIteration:
-            continue
-        heapq.heappush(
-            heap,
-            (
-                _stream_sort_key(next_merged.row, next_merged.kind, next_merged.source_order),
-                iterator_index,
-                next_merged,
-            ),
-        )
+        streams: list[_MergeStream] = []
+        for source_order, (kind, key) in enumerate(stream_specs):
+            start_ts_ms = window.start_ts_ms
+            end_ts_exclusive_ms = window.end_ts_exclusive_ms
+
+            def within_window(
+                row: dict[str, Any],
+                *,
+                start_ts_ms: int = start_ts_ms,
+                end_ts_exclusive_ms: int = end_ts_exclusive_ms,
+            ) -> bool:
+                ts_ms = int(row["ts_ms"])
+                return start_ts_ms <= ts_ms < end_ts_exclusive_ms
+
+            streams.append(
+                _MergeStream(
+                    iterator=_iter_parquet_rows(
+                        payload_cache[key],
+                        extra_fields={"canonical_venue": Venue.POLYMARKET.value},
+                        filter_fn=within_window,
+                    ),
+                    kind=kind,
+                    source_order=source_order,
+                )
+            )
+
+        yield from _merge_sorted_streams(streams)
 
 
-def _build_polymarket_shard_from_tasks(
+def _build_polymarket_shard(
     *,
     shard_id: str,
     shard_key: str,
@@ -391,85 +719,60 @@ def _build_polymarket_shard_from_tasks(
     outcomes: OutcomesMode,
     depth: int,
     contracts: list[_PolymarketContract],
-    pending_fetches: list[tuple[int, str, str, Callable[[dict[str, Any]], bool] | None]],
+    windows: list[_PolymarketWindow],
     s3_store: S3Store,
     shard_repo: CanonicalShardRepository,
     force: bool = False,
 ) -> CanonicalShardRecord:
-    if not pending_fetches:
-        return _materialize_polymarket_shard(
-            shard_id=shard_id,
-            shard_key=shard_key,
-            manifest_key=manifest_key,
-            series_key=series_key,
-            outcomes=outcomes.value,
-            date=date,
-            depth=depth,
-            contracts=contracts,
-            merged_rows=iter(()),
+    stats = _PolymarketBuildStats(
+        contracts_discovered=len(contracts),
+        windows_planned=len(windows),
+    )
+    source_refs = _collect_polymarket_source_refs(windows)
+    total_started_at = perf_counter()
+    logger.info(
+        "building polymarket canonical shard series=%s date=%s contracts=%d windows=%d sources=%d depth=%d",
+        series_key,
+        date,
+        stats.contracts_discovered,
+        stats.windows_planned,
+        len(source_refs),
+        depth,
+    )
+    record = _materialize_polymarket_shard(
+        shard_id=shard_id,
+        shard_key=shard_key,
+        manifest_key=manifest_key,
+        series_key=series_key,
+        outcomes=outcomes.value,
+        date=date,
+        depth=depth,
+        contracts=contracts,
+        merged_rows=_iter_polymarket_window_rows(
+            windows=windows,
             s3_store=s3_store,
-            shard_repo=shard_repo,
-            source_refs=[],
-            force=force,
-        )
-
-    fragment_stream_limit = 64
-    venue_label = _venue_label(Venue.POLYMARKET)
-    fragment_dir = tempfile.mkdtemp(prefix=f"{shard_id}-")
-    fragment_paths: list[str] = []
-    source_refs: list[str] = []
-    try:
-        for fragment_index, task_chunk in enumerate(_chunked(pending_fetches, fragment_stream_limit)):
-            streams = []
-            fetched: list[tuple[int, str, str, Callable[[dict[str, Any]], bool] | None, bytes]] = []
-            with ThreadPoolExecutor(max_workers=min(8, len(task_chunk))) as executor:
-                future_map = {
-                    executor.submit(s3_store.get_bytes, key): (source_order, kind, key, filter_fn)
-                    for source_order, kind, key, filter_fn in task_chunk
-                }
-                for future in as_completed(future_map):
-                    source_order, kind, key, filter_fn = future_map[future]
-                    fetched.append((source_order, kind, key, filter_fn, future.result()))
-
-            for source_order, kind, key, filter_fn, payload in sorted(
-                fetched, key=lambda item: item[0]
-            ):
-                streams.append(
-                    _MergeStream(
-                        iterator=_iter_parquet_rows(
-                            payload,
-                            extra_fields={"venue_label": venue_label},
-                            filter_fn=filter_fn,
-                        ),
-                        kind=kind,
-                        source_order=source_order,
-                    )
-                )
-                source_refs.append(key)
-
-            if not streams:
-                continue
-            fragment_path = f"{fragment_dir}/fragment-{fragment_index:04d}.jsonl"
-            _write_fragment(fragment_path, streams)
-            fragment_paths.append(fragment_path)
-
-        return _materialize_polymarket_shard(
-            shard_id=shard_id,
-            shard_key=shard_key,
-            manifest_key=manifest_key,
-            series_key=series_key,
-            outcomes=outcomes.value,
-            date=date,
-            depth=depth,
-            contracts=contracts,
-            merged_rows=_merge_fragment_files(fragment_paths),
-            s3_store=s3_store,
-            shard_repo=shard_repo,
-            source_refs=source_refs,
-            force=force,
-        )
-    finally:
-        shutil.rmtree(fragment_dir, ignore_errors=True)
+            stats=stats,
+        ),
+        s3_store=s3_store,
+        shard_repo=shard_repo,
+        source_refs=source_refs,
+        force=force,
+        stats=stats,
+    )
+    logger.info(
+        "completed polymarket canonical shard series=%s date=%s contracts=%d windows=%d fetched_objects=%d fetched_bytes=%d emitted_rows=%d fetch_seconds=%.3f emit_seconds=%.3f total_seconds=%.3f",
+        series_key,
+        date,
+        stats.contracts_discovered,
+        stats.windows_planned,
+        stats.objects_fetched,
+        stats.bytes_fetched,
+        stats.rows_emitted,
+        stats.fetch_seconds,
+        stats.emit_seconds,
+        perf_counter() - total_started_at,
+    )
+    return record
 
 
 def _materialize_polymarket_shard(
@@ -487,15 +790,14 @@ def _materialize_polymarket_shard(
     shard_repo: CanonicalShardRepository,
     source_refs: list[str],
     force: bool = False,
+    stats: _PolymarketBuildStats | None = None,
 ) -> CanonicalShardRecord:
     existing = shard_repo.get(shard_id)
     if (
         not force
         and existing is not None
         and existing.status == CanonicalShardStatus.READY
-        and s3_store.exists(
-        existing.shard_s3_key
-        )
+        and s3_store.exists(existing.shard_s3_key)
     ):
         return existing
 
@@ -504,6 +806,7 @@ def _materialize_polymarket_shard(
     start_ts_ms: int | None = None
     end_ts_ms: int | None = None
     schedule = _PolymarketContractSchedule(contracts)
+    emit_started_at = perf_counter()
 
     with open(temp_path, "wb") as raw_file:
         with zstandard.ZstdCompressor(level=3).stream_writer(raw_file) as writer:
@@ -517,6 +820,8 @@ def _materialize_polymarket_shard(
                     writer.write(orjson.dumps(event))
                     writer.write(b"\n")
                     event_count += 1
+                    if stats is not None:
+                        stats.rows_emitted += 1
 
                 if start_ts_ms is None:
                     start_ts_ms = ts_ms
@@ -527,6 +832,8 @@ def _materialize_polymarket_shard(
                     writer.write(orjson.dumps(_snapshot_event(row, depth=depth)))
                 writer.write(b"\n")
                 event_count += 1
+                if stats is not None:
+                    stats.rows_emitted += 1
 
             if event_count == 0 and contracts:
                 ts_ms = contracts[0].start_ts_ms
@@ -537,6 +844,10 @@ def _materialize_polymarket_shard(
                     writer.write(orjson.dumps(event))
                     writer.write(b"\n")
                     event_count += 1
+                    if stats is not None:
+                        stats.rows_emitted += 1
+    if stats is not None:
+        stats.emit_seconds += perf_counter() - emit_started_at
 
     s3_store.put_file(shard_key, temp_path, content_type="application/zstd")
     created_at = utc_now_iso()
@@ -597,10 +908,16 @@ def _materialize_shard(
     s3_store: S3Store,
     shard_repo: CanonicalShardRepository,
     source_refs: list[str],
+    force: bool = False,
 ) -> CanonicalShardRecord:
     existing = shard_repo.get(shard_id)
-    if existing is not None and existing.status == CanonicalShardStatus.READY and s3_store.exists(
+    if (
+        not force
+        and existing is not None
+        and existing.status == CanonicalShardStatus.READY
+        and s3_store.exists(
         existing.shard_s3_key
+        )
     ):
         return existing
 
@@ -682,6 +999,7 @@ def _build_shard(
     s3_store: S3Store,
     shard_repo: CanonicalShardRepository,
     source_refs: list[str],
+    force: bool = False,
 ) -> CanonicalShardRecord:
     return _materialize_shard(
         shard_id=shard_id,
@@ -698,6 +1016,7 @@ def _build_shard(
         s3_store=s3_store,
         shard_repo=shard_repo,
         source_refs=source_refs,
+        force=force,
     )
 
 
@@ -709,6 +1028,7 @@ def build_hyperliquid_canonical_day(
     s3_store: S3Store,
     coverage_repo: CoverageRepository,
     shard_repo: CanonicalShardRepository,
+    force: bool = False,
 ) -> CanonicalShardRecord:
     l2_daily = _coverage_record(coverage_repo, DatasetKind.NORMALIZED_L2, market, date, "daily")
     if l2_daily is None:
@@ -722,7 +1042,6 @@ def build_hyperliquid_canonical_day(
     manifest_key = canonical_hyperliquid_manifest_s3_key(market, date, depth)
     streams: list[_MergeStream] = []
     source_refs: list[str] = []
-    venue_label = _venue_label(market.venue)
 
     for hour in range(24):
         trade_key = normalized_trade_s3_key(market, date, hour)
@@ -737,7 +1056,10 @@ def build_hyperliquid_canonical_day(
                 _MergeStream(
                     iterator=_iter_parquet_rows(
                         s3_store.get_bytes(trade_key),
-                        extra_fields={"venue_label": venue_label},
+                        extra_fields={
+                            "canonical_venue": market.venue.value,
+                            "canonical_market_type": market.market_type.value,
+                        },
                     ),
                     kind="trade",
                     source_order=hour * 2,
@@ -751,7 +1073,10 @@ def build_hyperliquid_canonical_day(
                 _MergeStream(
                     iterator=_iter_parquet_rows(
                         s3_store.get_bytes(l2_key),
-                        extra_fields={"venue_label": venue_label},
+                        extra_fields={
+                            "canonical_venue": market.venue.value,
+                            "canonical_market_type": market.market_type.value,
+                        },
                     ),
                     kind="l2",
                     source_order=hour * 2 + 1,
@@ -773,6 +1098,7 @@ def build_hyperliquid_canonical_day(
         s3_store=s3_store,
         shard_repo=shard_repo,
         source_refs=source_refs,
+        force=force,
     )
 
 
@@ -812,32 +1138,21 @@ def build_polymarket_canonical_day(
     )
     contracts = _group_polymarket_contracts(active_resolutions)
     schedule = _PolymarketContractSchedule(contracts)
-    pending_fetches: list[tuple[int, str, str, Callable[[dict[str, Any]], bool] | None]] = []
-    for source_order, resolution in enumerate(
-        sorted(active_resolutions, key=lambda item: (item.start_ts_ms, item.slug, item.outcome))
-    ):
-        market = resolution.market_ref()
-        l2_record = _coverage_record(coverage_repo, DatasetKind.NORMALIZED_L2, market, date, "daily")
-        if l2_record is None:
-            raise ValueError(f"normalized L2 coverage is not ready for {resolution.instrument} {date}")
-        trade_record = _coverage_record(coverage_repo, DatasetKind.NORMALIZED_TRADES, market, date, "daily")
-        if trade_record is None:
-            raise ValueError(
-                f"normalized trade coverage is not ready for {resolution.instrument} {date}"
-            )
+    sources = _polymarket_sources_from_resolutions(
+        date=date,
+        resolutions=active_resolutions,
+        coverage_repo=coverage_repo,
+    )
+    sources_by_slug: dict[str, list[_PolymarketResolutionSource]] = {}
+    for source in sources:
+        sources_by_slug.setdefault(source.resolution.slug, []).append(source)
+    windows = _plan_polymarket_windows(
+        date=date,
+        schedule=schedule,
+        sources_by_slug=sources_by_slug,
+    )
 
-        l2_key = polymarket_normalized_l2_s3_key(market, resolution.market_id, date)
-        trade_key = polymarket_normalized_trade_s3_key(market, resolution.market_id, date)
-
-        def within_current_or_next(row: dict[str, Any], *, slug=resolution.slug) -> bool:
-            return _polymarket_row_allowed(schedule, slug=slug, ts_ms=int(row["ts_ms"]))
-
-        if trade_record.row_count > 0:
-            pending_fetches.append((source_order * 2, "trade", trade_key, within_current_or_next))
-        if l2_record.row_count > 0:
-            pending_fetches.append((source_order * 2 + 1, "l2", l2_key, within_current_or_next))
-
-    return _build_polymarket_shard_from_tasks(
+    return _build_polymarket_shard(
         shard_id=shard_id,
         shard_key=shard_key,
         manifest_key=manifest_key,
@@ -846,7 +1161,7 @@ def build_polymarket_canonical_day(
         outcomes=outcomes,
         depth=depth,
         contracts=contracts,
-        pending_fetches=pending_fetches,
+        windows=windows,
         s3_store=s3_store,
         shard_repo=shard_repo,
         force=force,
@@ -861,8 +1176,7 @@ def _load_polymarket_resolutions_from_storage(
 ) -> list[PolymarketMarketResolution]:
     paginator = s3_store.client.get_paginator("list_objects_v2")
     prefix = "metadata/polymarket/"
-    resolutions: list[PolymarketMarketResolution] = []
-    seen: set[tuple[str, str]] = set()
+    candidate_keys: list[str] = []
     for page in paginator.paginate(Bucket=s3_store.bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
@@ -872,17 +1186,58 @@ def _load_polymarket_resolutions_from_storage(
             instrument = unquote(
                 next(part.split("=", 1)[1] for part in parts if part.startswith("instrument="))
             )
-            if not instrument.startswith(f"{series_key}-"):
-                continue
-            resolution = PolymarketMarketResolution.model_validate(orjson.loads(s3_store.get_bytes(key)))
-            if date not in resolution.dates:
-                continue
-            dedupe_key = (resolution.slug, resolution.outcome)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            resolutions.append(resolution)
+            if instrument.startswith(f"{series_key}-"):
+                candidate_keys.append(key)
+
+    resolutions: list[PolymarketMarketResolution] = []
+    seen: set[tuple[str, str]] = set()
+    if candidate_keys:
+        with ThreadPoolExecutor(max_workers=min(16, len(candidate_keys))) as executor:
+            future_map = {executor.submit(s3_store.get_bytes, key): key for key in candidate_keys}
+            for future in as_completed(future_map):
+                resolution = PolymarketMarketResolution.model_validate(orjson.loads(future.result()))
+                if date not in resolution.dates:
+                    continue
+                dedupe_key = (resolution.slug, resolution.outcome)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                resolutions.append(resolution)
     return sorted(resolutions, key=lambda item: (item.start_ts_ms, item.slug, item.outcome))
+
+
+def _polymarket_sources_from_resolutions(
+    *,
+    date: str,
+    resolutions: list[PolymarketMarketResolution],
+    coverage_repo: CoverageRepository,
+) -> list[_PolymarketResolutionSource]:
+    sources: list[_PolymarketResolutionSource] = []
+    for resolution in sorted(resolutions, key=lambda item: (item.start_ts_ms, item.slug, item.outcome)):
+        market = resolution.market_ref()
+        l2_record = _coverage_record(coverage_repo, DatasetKind.NORMALIZED_L2, market, date, "daily")
+        if l2_record is None:
+            raise ValueError(f"normalized L2 coverage is not ready for {resolution.instrument} {date}")
+        trade_record = _coverage_record(coverage_repo, DatasetKind.NORMALIZED_TRADES, market, date, "daily")
+        if trade_record is None:
+            raise ValueError(f"normalized trade coverage is not ready for {resolution.instrument} {date}")
+
+        sources.append(
+            _PolymarketResolutionSource(
+                resolution=resolution,
+                trade_key=(
+                    polymarket_normalized_trade_s3_key(market, resolution.market_id, date)
+                    if trade_record.row_count > 0
+                    else None
+                ),
+                l2_key=(
+                    polymarket_normalized_l2_s3_key(market, resolution.market_id, date)
+                    if l2_record.row_count > 0
+                    else None
+                ),
+            )
+        )
+    return sources
 
 
 def _list_polymarket_normalized_keys(
@@ -936,6 +1291,77 @@ def _infer_polymarket_resolution_from_key(
     )
 
 
+def _polymarket_sources_from_storage(
+    *,
+    date: str,
+    series_key: str,
+    s3_store: S3Store,
+) -> tuple[list[PolymarketMarketResolution], list[_PolymarketResolutionSource]]:
+    metadata_resolutions = _load_polymarket_resolutions_from_storage(
+        date=date,
+        series_key=series_key,
+        s3_store=s3_store,
+    )
+    if metadata_resolutions:
+        sources = [
+            _PolymarketResolutionSource(
+                resolution=resolution,
+                trade_key=polymarket_normalized_trade_s3_key(
+                    resolution.market_ref(),
+                    resolution.market_id,
+                    date,
+                ),
+                l2_key=polymarket_normalized_l2_s3_key(
+                    resolution.market_ref(),
+                    resolution.market_id,
+                    date,
+                ),
+            )
+            for resolution in sorted(
+                metadata_resolutions,
+                key=lambda item: (item.start_ts_ms, item.slug, item.outcome),
+            )
+        ]
+        return metadata_resolutions, sources
+
+    trade_keys = _list_polymarket_normalized_keys(
+        date=date,
+        series_key=series_key,
+        kind="trade",
+        s3_store=s3_store,
+    )
+    l2_keys = _list_polymarket_normalized_keys(
+        date=date,
+        series_key=series_key,
+        kind="l2_snapshot",
+        s3_store=s3_store,
+    )
+    all_keys = sorted(set(trade_keys) | set(l2_keys))
+    if not all_keys:
+        raise ValueError(f"no normalized polymarket objects were found for {series_key} on {date}")
+    resolution_by_key = {
+        (resolution.instrument, resolution.market_id): resolution
+        for resolution in metadata_resolutions
+    }
+    resolutions: list[PolymarketMarketResolution] = []
+    sources: list[_PolymarketResolutionSource] = []
+    for key_parts in all_keys:
+        resolution = resolution_by_key.get(key_parts) or _infer_polymarket_resolution_from_key(
+            instrument=key_parts[0],
+            market_id=key_parts[1],
+            date=date,
+        )
+        resolutions.append(resolution)
+        sources.append(
+            _PolymarketResolutionSource(
+                resolution=resolution,
+                trade_key=trade_keys.get(key_parts),
+                l2_key=l2_keys.get(key_parts),
+            )
+        )
+    return resolutions, _sort_resolution_sources(sources)
+
+
 def build_polymarket_canonical_day_from_storage(
     *,
     date: str,
@@ -964,61 +1390,23 @@ def build_polymarket_canonical_day_from_storage(
         outcomes=outcomes,
         depth=depth,
     )
-
-    trade_keys = _list_polymarket_normalized_keys(
-        date=date,
-        series_key=series_key,
-        kind="trade",
-        s3_store=s3_store,
-    )
-    l2_keys = _list_polymarket_normalized_keys(
-        date=date,
-        series_key=series_key,
-        kind="l2_snapshot",
-        s3_store=s3_store,
-    )
-    all_keys = sorted(set(trade_keys) | set(l2_keys))
-    if not all_keys:
-        raise ValueError(f"no normalized polymarket objects were found for {series_key} on {date}")
-
-    metadata_resolutions = _load_polymarket_resolutions_from_storage(
+    resolutions, sources = _polymarket_sources_from_storage(
         date=date,
         series_key=series_key,
         s3_store=s3_store,
     )
-    resolution_by_key = {
-        (resolution.instrument, resolution.market_id): resolution
-        for resolution in metadata_resolutions
-    }
-    resolutions = [
-        resolution_by_key.get(key_parts)
-        or _infer_polymarket_resolution_from_key(
-            instrument=key_parts[0],
-            market_id=key_parts[1],
-            date=date,
-        )
-        for key_parts in all_keys
-    ]
-
     contracts = _group_polymarket_contracts(resolutions)
     schedule = _PolymarketContractSchedule(contracts)
-    pending_fetches: list[tuple[int, str, str, Callable[[dict[str, Any]], bool] | None]] = []
-    for source_order, resolution in enumerate(resolutions):
-        trade_key = trade_keys.get((resolution.instrument, resolution.market_id))
-        l2_key = l2_keys.get((resolution.instrument, resolution.market_id))
+    sources_by_slug: dict[str, list[_PolymarketResolutionSource]] = {}
+    for source in sources:
+        sources_by_slug.setdefault(source.resolution.slug, []).append(source)
+    windows = _plan_polymarket_windows(
+        date=date,
+        schedule=schedule,
+        sources_by_slug=sources_by_slug,
+    )
 
-        def within_current_or_next(row: dict[str, Any], *, slug=resolution.slug) -> bool:
-            return _polymarket_row_allowed(schedule, slug=slug, ts_ms=int(row["ts_ms"]))
-
-        if trade_key is not None:
-            pending_fetches.append((source_order * 2, "trade", trade_key, within_current_or_next))
-        if l2_key is not None:
-            pending_fetches.append((source_order * 2 + 1, "l2", l2_key, within_current_or_next))
-
-    if not pending_fetches:
-        raise ValueError(f"no normalized polymarket objects were found for {series_key} on {date}")
-
-    return _build_polymarket_shard_from_tasks(
+    return _build_polymarket_shard(
         shard_id=shard_id,
         shard_key=shard_key,
         manifest_key=manifest_key,
@@ -1027,7 +1415,7 @@ def build_polymarket_canonical_day_from_storage(
         outcomes=outcomes,
         depth=depth,
         contracts=contracts,
-        pending_fetches=pending_fetches,
+        windows=windows,
         s3_store=s3_store,
         shard_repo=shard_repo,
         force=force,

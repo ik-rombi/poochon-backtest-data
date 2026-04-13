@@ -251,5 +251,129 @@ def test_build_hyperliquid_canonical_day_orders_trade_before_snapshot() -> None:
     first = orjson.loads(payload[0])
     second = orjson.loads(payload[1])
     assert first["Market"]["Trade"]["side"] == "Buy"
+    assert first["Market"]["Trade"]["instrument"] == {
+        "Hyperliquid": {"market_type": "Perp", "symbol": "BTC"}
+    }
+    assert second["Market"]["L2Snapshot"]["instrument"] == {
+        "Hyperliquid": {"market_type": "Perp", "symbol": "BTC"}
+    }
     assert second["Market"]["L2Snapshot"]["bids"][0]["level_count"] == 2
     assert len(second["Market"]["L2Snapshot"]["bids"]) == 1
+
+
+def test_build_hyperliquid_canonical_day_force_rewrites_existing_shard() -> None:
+    market = MarketRef(market_type="perp", instrument="BTC")
+    date = "2026-02-19"
+    store = FakeS3Store()
+    coverage = FakeCoverageRepository(
+        {
+            coverage_pk(DatasetKind.NORMALIZED_L2, market, date, "daily"): ready_coverage(
+                DatasetKind.NORMALIZED_L2, market, date
+            ),
+            coverage_pk(DatasetKind.NORMALIZED_TRADES, market, date, "daily"): ready_coverage(
+                DatasetKind.NORMALIZED_TRADES, market, date
+            ),
+        }
+    )
+    shard_repo = FakeShardRepository()
+
+    l2_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("bids_json", pa.large_string()),
+            ("asks_json", pa.large_string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+    trade_schema = pa.schema(
+        [
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("side", pa.string()),
+            ("px", pa.float64()),
+            ("sz", pa.float64()),
+            ("hash", pa.string()),
+            ("source_hour", pa.int8()),
+            ("source_line_number", pa.int64()),
+        ]
+    )
+
+    empty_l2 = parquet_bytes([], l2_schema)
+    empty_trades = parquet_bytes([], trade_schema)
+    for hour in range(24):
+        store.objects[normalized_l2_s3_key(market, date, hour)] = empty_l2
+        store.objects[normalized_trade_s3_key(market, date, hour)] = empty_trades
+
+    store.objects[normalized_trade_s3_key(market, date, 0)] = parquet_bytes(
+        [
+            {
+                "ts_ms": 1000,
+                "instrument": "BTC",
+                "side": "Buy",
+                "px": 100.5,
+                "sz": 0.25,
+                "hash": "0xtrade",
+                "source_hour": 0,
+                "source_line_number": 1,
+            }
+        ],
+        trade_schema,
+    )
+    store.objects[normalized_l2_s3_key(market, date, 0)] = parquet_bytes(
+        [
+            {
+                "ts_ms": 1000,
+                "instrument": "BTC",
+                "bids_json": '[{"px":"100.0","sz":"1.0","n":2}]',
+                "asks_json": '[{"px":"101.0","sz":"1.5","n":3}]',
+                "source_hour": 0,
+                "source_line_number": 2,
+            }
+        ],
+        l2_schema,
+    )
+
+    record = build_hyperliquid_canonical_day(
+        market=market,
+        date=date,
+        depth=1,
+        s3_store=store,
+        coverage_repo=coverage,
+        shard_repo=shard_repo,
+    )
+    before = store.objects[record.shard_s3_key]
+
+    store.objects[normalized_trade_s3_key(market, date, 0)] = parquet_bytes(
+        [
+            {
+                "ts_ms": 1000,
+                "instrument": "BTC",
+                "side": "Buy",
+                "px": 101.5,
+                "sz": 0.25,
+                "hash": "0xtrade",
+                "source_hour": 0,
+                "source_line_number": 1,
+            }
+        ],
+        trade_schema,
+    )
+
+    build_hyperliquid_canonical_day(
+        market=market,
+        date=date,
+        depth=1,
+        s3_store=store,
+        coverage_repo=coverage,
+        shard_repo=shard_repo,
+        force=True,
+    )
+
+    after = store.objects[record.shard_s3_key]
+    assert after != before
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(after)) as reader:
+        payload = reader.read().decode("utf-8").strip().splitlines()
+    first = orjson.loads(payload[0])
+    assert first["Market"]["Trade"]["px"] == 101.5

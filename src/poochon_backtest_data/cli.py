@@ -3,19 +3,26 @@ from __future__ import annotations
 import argparse
 import logging
 
+import orjson
 import uvicorn
 
 from .api import create_app
 from .hyperliquid import sync_window
 from .models import (
     IngestionRequest,
+    MarketRef,
     MarketType,
     OutcomesMode,
     PolymarketSeriesSyncRequest,
+    Venue,
     iter_dates_inclusive,
 )
 from .polymarket_telonex import sync_series
-from .canonical import build_polymarket_canonical_day_from_storage
+from .canonical import (
+    build_hyperliquid_canonical_day,
+    build_polymarket_canonical_day_from_storage,
+    validate_polymarket_current_next_file,
+)
 from .settings import get_settings
 from .storage import CanonicalShardRepository, CoverageRepository, S3Store, boto3_session
 
@@ -66,6 +73,16 @@ def main() -> None:
     hyperliquid_sync_parser.add_argument("--end-offset-days", type=int)
     hyperliquid_sync_parser.add_argument("--depth", type=int, default=20)
 
+    hyperliquid_build_parser = subparsers.add_parser("hyperliquid-build-canonical-window")
+    hyperliquid_build_parser.add_argument(
+        "--market-type", choices=[MarketType.PERP.value, MarketType.SPOT.value], required=True
+    )
+    hyperliquid_build_parser.add_argument("--instrument", required=True)
+    hyperliquid_build_parser.add_argument("--start-date", required=True)
+    hyperliquid_build_parser.add_argument("--end-date", required=True)
+    hyperliquid_build_parser.add_argument("--depth", type=int, default=20)
+    hyperliquid_build_parser.add_argument("--force", action="store_true")
+
     polymarket_sync_parser = subparsers.add_parser("polymarket-sync-series")
     polymarket_sync_parser.add_argument("--series", required=True)
     polymarket_sync_parser.add_argument("--start-date", required=True)
@@ -88,6 +105,9 @@ def main() -> None:
     )
     polymarket_build_parser.add_argument("--depth", type=int, default=5)
     polymarket_build_parser.add_argument("--force", action="store_true")
+
+    polymarket_validate_parser = subparsers.add_parser("polymarket-validate-current-next")
+    polymarket_validate_parser.add_argument("--path", required=True)
 
     args = parser.parse_args()
     settings = get_settings()
@@ -121,6 +141,24 @@ def main() -> None:
         )
         return
 
+    if args.command == "hyperliquid-build-canonical-window":
+        market = MarketRef(
+            venue=Venue.HYPERLIQUID,
+            market_type=args.market_type,
+            instrument=args.instrument,
+        )
+        for date in iter_dates_inclusive(args.start_date, args.end_date):
+            build_hyperliquid_canonical_day(
+                market=market,
+                date=date,
+                depth=args.depth,
+                s3_store=s3_store,
+                coverage_repo=coverage_repo,
+                shard_repo=shard_repo,
+                force=args.force,
+            )
+        return
+
     if args.command == "polymarket-sync-series":
         sync_series(
             s3_store,
@@ -148,6 +186,11 @@ def main() -> None:
                 shard_repo=shard_repo,
                 force=args.force,
             )
+        return
+
+    if args.command == "polymarket-validate-current-next":
+        summary = validate_polymarket_current_next_file(args.path)
+        print(orjson.dumps(summary.__dict__, option=orjson.OPT_INDENT_2).decode("utf-8"))
         return
 
     raise RuntimeError(f"unsupported command: {args.command}")

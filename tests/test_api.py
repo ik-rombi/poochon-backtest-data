@@ -72,12 +72,12 @@ class FakeCanonicalReplayService:
         if manifest.venue == Venue.HYPERLIQUID:
             return iter(
                 [
-                    b'{"Market":{"Trade":{"instrument":{"venue":"Hyperliquid","symbol":"BTC"},"ts_ms":1,"px":100.0,"sz":0.1,"side":"Buy"}}}\n'
+                    b'{"Market":{"Trade":{"instrument":{"Hyperliquid":{"market_type":"Perp","symbol":"BTC"}},"ts_ms":1,"px":100.0,"sz":0.1,"side":"Buy"}}}\n'
                 ]
             )
         return iter(
             [
-                b'{"Market":{"Trade":{"instrument":{"venue":"Polymarket","symbol":"btc-updown-5m-1:Up"},"ts_ms":1,"px":0.5,"sz":10.0,"side":"Buy"}}}\n'
+                b'{"Market":{"Trade":{"instrument":{"Polymarket":{"symbol":"btc-updown-5m-1:Up"}},"ts_ms":1,"px":0.5,"sz":10.0,"side":"Buy"}}}\n'
             ]
         )
 
