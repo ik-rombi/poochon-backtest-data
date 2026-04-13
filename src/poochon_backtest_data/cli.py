@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import logging
 
-import orjson
 import uvicorn
 
 from .api import create_app
@@ -21,7 +20,6 @@ from .polymarket_telonex import sync_series
 from .canonical import (
     build_hyperliquid_canonical_day,
     build_polymarket_canonical_day_from_storage,
-    validate_polymarket_current_next_file,
 )
 from .settings import get_settings
 from .storage import CanonicalShardRepository, CoverageRepository, S3Store, boto3_session
@@ -106,9 +104,6 @@ def main() -> None:
     polymarket_build_parser.add_argument("--depth", type=int, default=5)
     polymarket_build_parser.add_argument("--force", action="store_true")
 
-    polymarket_validate_parser = subparsers.add_parser("polymarket-validate-current-next")
-    polymarket_validate_parser.add_argument("--path", required=True)
-
     args = parser.parse_args()
     settings = get_settings()
     _configure_logging(settings.log_level)
@@ -186,11 +181,6 @@ def main() -> None:
                 shard_repo=shard_repo,
                 force=args.force,
             )
-        return
-
-    if args.command == "polymarket-validate-current-next":
-        summary = validate_polymarket_current_next_file(args.path)
-        print(orjson.dumps(summary.__dict__, option=orjson.OPT_INDENT_2).decode("utf-8"))
         return
 
     raise RuntimeError(f"unsupported command: {args.command}")
