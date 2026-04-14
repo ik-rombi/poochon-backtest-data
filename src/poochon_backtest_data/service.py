@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Iterator
-
 from .models import (
     CanonicalShardRecord,
     CanonicalWindowManifest,
@@ -56,7 +54,7 @@ class CanonicalReplayService:
             end_date=end_date,
             depth=depth,
             shards=shards,
-            stream_path=f"/api/v1/canonical/hyperliquid/{market_type.value}/{instrument}/stream",
+            files_path_template="/api/v1/canonical/shards/{shard_id}/files/{file_name}",
         )
 
     def get_polymarket_manifest(
@@ -85,12 +83,19 @@ class CanonicalReplayService:
             end_date=end_date,
             depth=depth,
             shards=shards,
-            stream_path=f"/api/v1/canonical/polymarket/{series_key}/stream",
+            files_path_template="/api/v1/canonical/shards/{shard_id}/files/{file_name}",
         )
 
-    def stream_manifest(self, manifest: CanonicalWindowManifest) -> Iterator[bytes]:
-        for shard in manifest.shards:
-            yield from self.s3_store.stream_zstd(shard.shard_s3_key)
+    def get_shard_file(self, *, shard_id: str, file_name: str) -> tuple[bytes, str]:
+        shard = self.shard_repo.get(shard_id)
+        if shard is None:
+            raise ValueError(f"unknown canonical shard: {shard_id}")
+        for file in shard.files:
+            if file.file_name == file_name:
+                if not self.s3_store.exists(file.s3_key):
+                    raise ValueError(f"missing canonical shard file: {file.s3_key}")
+                return self.s3_store.get_bytes(file.s3_key), "application/vnd.apache.parquet"
+        raise ValueError(f"unknown canonical shard file: {shard_id}/{file_name}")
 
     def _load_hyperliquid_shards(
         self,
@@ -105,7 +110,7 @@ class CanonicalReplayService:
         for date in iter_dates_inclusive(start_date, end_date):
             shard_id = canonical_hyperliquid_shard_id(market, date, depth)
             shard = self.shard_repo.get(shard_id)
-            if shard is None or not self.s3_store.exists(shard.shard_s3_key):
+            if shard is None or not self._shard_ready(shard):
                 missing.append(date)
                 continue
             shards.append(shard)
@@ -135,7 +140,7 @@ class CanonicalReplayService:
                 depth=depth,
             )
             shard = self.shard_repo.get(shard_id)
-            if shard is None or not self.s3_store.exists(shard.shard_s3_key):
+            if shard is None or not self._shard_ready(shard):
                 missing.append(date)
                 continue
             shards.append(shard)
@@ -158,7 +163,7 @@ class CanonicalReplayService:
         end_date: str,
         depth: int,
         shards: tuple[CanonicalShardRecord, ...],
-        stream_path: str,
+        files_path_template: str,
     ) -> CanonicalWindowManifest:
         event_count = sum(shard.event_count for shard in shards)
         start_ts_ms = min(
@@ -183,7 +188,14 @@ class CanonicalReplayService:
             start_ts_ms=start_ts_ms,
             end_ts_ms=end_ts_ms,
             shard_ids=tuple(shard.shard_id for shard in shards),
-            shard_keys=tuple(shard.shard_s3_key for shard in shards),
+            shard_prefixes=tuple(shard.shard_prefix for shard in shards),
             shards=shards,
-            stream_path=stream_path,
+            files_path_template=files_path_template,
         )
+
+    def _shard_ready(self, shard: CanonicalShardRecord) -> bool:
+        if not self.s3_store.exists(shard.manifest_s3_key):
+            return False
+        if not shard.files:
+            return False
+        return all(self.s3_store.exists(file.s3_key) for file in shard.files)

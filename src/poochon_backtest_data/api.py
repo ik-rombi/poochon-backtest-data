@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 
 from .models import MarketType, OutcomesMode
 from .service import CanonicalReplayService
@@ -65,29 +65,6 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         return manifest
 
-    @app.get("/api/v1/canonical/hyperliquid/{market_type}/{instrument}/stream")
-    def stream_hyperliquid_window(
-        market_type: MarketType,
-        instrument: str,
-        start_date: str = Query(...),
-        end_date: str = Query(...),
-        depth: int = Query(20, ge=1),
-    ):
-        try:
-            manifest = replay_service.get_hyperliquid_manifest(
-                market_type=market_type,
-                instrument=instrument,
-                start_date=start_date,
-                end_date=end_date,
-                depth=depth,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        return StreamingResponse(
-            replay_service.stream_manifest(manifest),
-            media_type="application/x-ndjson",
-        )
-
     @app.get("/api/v1/canonical/polymarket/{series_key}")
     def get_polymarket_manifest(
         series_key: str,
@@ -108,27 +85,15 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         return manifest
 
-    @app.get("/api/v1/canonical/polymarket/{series_key}/stream")
-    def stream_polymarket_window(
-        series_key: str,
-        start_date: str = Query(...),
-        end_date: str = Query(...),
-        outcomes: OutcomesMode = Query(OutcomesMode.BOTH),
-        depth: int = Query(5, ge=1),
-    ):
+    @app.get("/api/v1/canonical/shards/{shard_id}/files/{file_name}")
+    def download_shard_file(shard_id: str, file_name: str):
         try:
-            manifest = replay_service.get_polymarket_manifest(
-                series_key=series_key,
-                start_date=start_date,
-                end_date=end_date,
-                outcomes=outcomes,
-                depth=depth,
+            payload, media_type = replay_service.get_shard_file(
+                shard_id=shard_id,
+                file_name=file_name,
             )
         except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        return StreamingResponse(
-            replay_service.stream_manifest(manifest),
-            media_type="application/x-ndjson",
-        )
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return Response(content=payload, media_type=media_type)
 
     return app

@@ -17,6 +17,7 @@ from poochon_backtest_data.canonical import (
     validate_polymarket_current_next_file,
 )
 from poochon_backtest_data.models import (
+    CanonicalFileFamily,
     CanonicalShardRecord,
     CoverageRecord,
     CoverageStatus,
@@ -97,6 +98,120 @@ def write_jsonl_zst(path: Path, rows: list[dict]) -> None:
             for row in rows:
                 writer.write(orjson.dumps(row))
                 writer.write(b"\n")
+
+
+def canonical_family_rows(
+    store: FakeS3Store,
+    record: CanonicalShardRecord,
+    family: CanonicalFileFamily,
+) -> list[dict]:
+    file = next(item for item in record.files if item.family == family)
+    return pq.read_table(io.BytesIO(store.objects[file.s3_key])).to_pylist()
+
+
+def canonical_payloads(store: FakeS3Store, record: CanonicalShardRecord) -> list[dict]:
+    payloads: list[tuple[int, dict]] = []
+
+    for row in canonical_family_rows(store, record, CanonicalFileFamily.CONTRACTS):
+        payloads.append(
+            (
+                int(row["event_seq"]),
+                {
+                    "Contract": {
+                        "Polymarket": {
+                            "kind": row["kind"],
+                            "ts_ms": int(row["ts_ms"]),
+                            "series_key": row["series_key"],
+                            "slug": row["slug"],
+                            "market_id": row["market_id"],
+                            "start_ts_ms": int(row["start_ts_ms"]),
+                            "end_ts_ms": int(row["end_ts_ms"]),
+                            "price_to_beat": row["price_to_beat"],
+                            "price_to_beat_source": row["price_to_beat_source"],
+                            "price_to_beat_quality": row["price_to_beat_quality"],
+                            "outcomes": [
+                                {
+                                    "outcome": row["outcome_0"],
+                                    "asset_id": row["outcome_0_asset_id"],
+                                    "instrument": {
+                                        "Polymarket": {
+                                            "symbol": row["outcome_0_instrument"]
+                                        }
+                                    },
+                                },
+                                {
+                                    "outcome": row["outcome_1"],
+                                    "asset_id": row["outcome_1_asset_id"],
+                                    "instrument": {
+                                        "Polymarket": {
+                                            "symbol": row["outcome_1_instrument"]
+                                        }
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                },
+            )
+        )
+
+    for row in canonical_family_rows(store, record, CanonicalFileFamily.TRADES):
+        payloads.append(
+            (
+                int(row["event_seq"]),
+                {
+                    "Market": {
+                        "Trade": {
+                            "instrument": {"Polymarket": {"symbol": row["instrument"]}},
+                            "ts_ms": int(row["ts_ms"]),
+                            "px": float(row["px"]),
+                            "sz": float(row["sz"]),
+                            "side": row["side"],
+                        }
+                    }
+                },
+            )
+        )
+
+    for row in canonical_family_rows(store, record, CanonicalFileFamily.BOOKS):
+        bids = []
+        asks = []
+        for index in range(record.depth):
+            bid_px = row.get(f"bid_px_{index}")
+            if bid_px is not None:
+                bids.append(
+                    {
+                        "px": float(bid_px),
+                        "sz": float(row[f"bid_sz_{index}"]),
+                        "level_count": int(row[f"bid_level_count_{index}"]),
+                    }
+                )
+            ask_px = row.get(f"ask_px_{index}")
+            if ask_px is not None:
+                asks.append(
+                    {
+                        "px": float(ask_px),
+                        "sz": float(row[f"ask_sz_{index}"]),
+                        "level_count": int(row[f"ask_level_count_{index}"]),
+                    }
+                )
+        payloads.append(
+            (
+                int(row["event_seq"]),
+                {
+                    "Market": {
+                        "L2Snapshot": {
+                            "instrument": {"Polymarket": {"symbol": row["instrument"]}},
+                            "ts_ms": int(row["ts_ms"]),
+                            "bids": bids,
+                            "asks": asks,
+                        }
+                    }
+                },
+            )
+        )
+
+    return [payload for _, payload in sorted(payloads, key=lambda item: item[0])]
 
 
 def market_payload(
@@ -554,10 +669,9 @@ def test_build_polymarket_canonical_day_merges_both_outcomes() -> None:
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
-    first = orjson.loads(payload[0])
-    second = orjson.loads(payload[1])
+    payload = canonical_payloads(store, record)
+    first = payload[0]
+    second = payload[1]
     assert len(payload) == 5
     assert first["Contract"]["Polymarket"]["kind"] == "ListedCurrent"
     assert first["Contract"]["Polymarket"]["outcomes"][0]["instrument"] == {
@@ -570,8 +684,8 @@ def test_build_polymarket_canonical_day_merges_both_outcomes() -> None:
         {"Polymarket": {"symbol": "btc-updown-5m-1:Down"}},
         {"Polymarket": {"symbol": "btc-updown-5m-1:Up"}},
     )
-    assert any('"btc-updown-5m-1:Up"' in line for line in payload)
-    assert any('"btc-updown-5m-1:Down"' in line for line in payload)
+    assert any("btc-updown-5m-1:Up" in orjson.dumps(item).decode("utf-8") for item in payload)
+    assert any("btc-updown-5m-1:Down" in orjson.dumps(item).decode("utf-8") for item in payload)
 
 
 def test_build_polymarket_canonical_day_from_storage_scans_normalized_objects() -> None:
@@ -680,18 +794,17 @@ def test_build_polymarket_canonical_day_from_storage_scans_normalized_objects() 
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
-    first = orjson.loads(payload[0])
-    second = orjson.loads(payload[1])
+    payload = canonical_payloads(store, record)
+    first = payload[0]
+    second = payload[1]
     assert len(payload) == 5
     assert first["Contract"]["Polymarket"]["kind"] == "ListedCurrent"
     assert second["Market"]["Trade"]["instrument"] in (
         {"Polymarket": {"symbol": "btc-updown-5m-1:Down"}},
         {"Polymarket": {"symbol": "btc-updown-5m-1:Up"}},
     )
-    assert any('"btc-updown-5m-1:Up"' in line for line in payload)
-    assert any('"btc-updown-5m-1:Down"' in line for line in payload)
+    assert any("btc-updown-5m-1:Up" in orjson.dumps(item).decode("utf-8") for item in payload)
+    assert any("btc-updown-5m-1:Down" in orjson.dumps(item).decode("utf-8") for item in payload)
 
 
 def test_build_polymarket_canonical_day_from_storage_emits_listed_next_for_adjacent_contracts() -> None:
@@ -803,10 +916,9 @@ def test_build_polymarket_canonical_day_from_storage_emits_listed_next_for_adjac
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
-    first = orjson.loads(payload[0])
-    second = orjson.loads(payload[1])
+    payload = canonical_payloads(store, record)
+    first = payload[0]
+    second = payload[1]
 
     assert first["Contract"]["Polymarket"]["kind"] == "ListedCurrent"
     assert first["Contract"]["Polymarket"]["slug"] == "btc-updown-5m-1771459200"
@@ -924,8 +1036,7 @@ def test_build_polymarket_canonical_day_filters_to_current_and_next_contracts() 
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8")
+    payload = orjson.dumps(canonical_payloads(store, record)).decode("utf-8")
 
     assert "btc-updown-5m-1771459200:Up" in payload
     assert "btc-updown-5m-1771459500:Up" in payload
@@ -1031,13 +1142,11 @@ def test_build_polymarket_canonical_day_rolls_forward_to_new_current_and_next() 
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
-
+    payload = canonical_payloads(store, record)
     contract_rows = [
-        orjson.loads(line)["Contract"]["Polymarket"]
-        for line in payload
-        if '"Contract"' in line
+        item["Contract"]["Polymarket"]
+        for item in payload
+        if "Contract" in item
     ]
 
     assert [(row["kind"], row["slug"]) for row in contract_rows] == [
@@ -1047,7 +1156,7 @@ def test_build_polymarket_canonical_day_rolls_forward_to_new_current_and_next() 
         ("Activated", "btc-updown-5m-1771459500"),
         ("ListedNext", "btc-updown-5m-1771459800"),
     ]
-    assert "btc-updown-5m-1771459800:Up" in "\n".join(payload)
+    assert "btc-updown-5m-1771459800:Up" in orjson.dumps(payload).decode("utf-8")
 
 
 def test_validate_polymarket_current_next_file_accepts_current_next_rollover(tmp_path: Path) -> None:
@@ -1289,10 +1398,9 @@ def test_build_polymarket_canonical_day_from_storage_falls_back_without_metadata
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
+    payload = canonical_payloads(store, record)
     assert payload
-    assert '"Contract"' in payload[0]
+    assert "Contract" in payload[0]
 
 
 def test_sync_series_clips_market_dates_to_requested_window(monkeypatch) -> None:

@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from poochon_backtest_data.api import create_app
 from poochon_backtest_data.models import (
+    CanonicalFileFamily,
+    CanonicalShardFile,
     CanonicalShardRecord,
     CanonicalShardStatus,
     CanonicalWindowManifest,
@@ -29,7 +31,7 @@ class FakeCanonicalReplayService:
             start_ts_ms=1,
             end_ts_ms=2,
             shard_ids=("shard-1",),
-            shard_keys=("canonical/hyperliquid/one",),
+            shard_prefixes=("canonical/hyperliquid/one/",),
             shards=(
                 CanonicalShardRecord(
                     shard_id="shard-1",
@@ -41,16 +43,32 @@ class FakeCanonicalReplayService:
                     outcomes=None,
                     date="2026-02-19",
                     depth=20,
-                    shard_s3_key="canonical/hyperliquid/one",
-                    manifest_s3_key="canonical/hyperliquid/one.json",
+                    shard_prefix="canonical/hyperliquid/one/",
+                    manifest_s3_key="canonical/hyperliquid/one/manifest.json",
                     event_count=2,
                     start_ts_ms=1,
                     end_ts_ms=2,
                     created_at="2026-04-09T00:00:00+00:00",
                     updated_at="2026-04-09T00:00:00+00:00",
+                    files=(
+                        CanonicalShardFile(
+                            family=CanonicalFileFamily.TRADES,
+                            file_name="trades.parquet",
+                            s3_key="canonical/hyperliquid/one/trades.parquet",
+                            row_count=1,
+                            size_bytes=11,
+                        ),
+                        CanonicalShardFile(
+                            family=CanonicalFileFamily.BOOKS,
+                            file_name="books.parquet",
+                            s3_key="canonical/hyperliquid/one/books.parquet",
+                            row_count=1,
+                            size_bytes=12,
+                        ),
+                    ),
                 ),
             ),
-            stream_path="/api/v1/canonical/hyperliquid/perp/BTC/stream",
+            files_path_template="/api/v1/canonical/shards/{shard_id}/files/{file_name}",
         )
 
     def get_hyperliquid_manifest(self, **_: object):
@@ -64,22 +82,12 @@ class FakeCanonicalReplayService:
                 "instrument": None,
                 "series_key": "btc-updown-5m",
                 "outcomes": "both",
-                "stream_path": "/api/v1/canonical/polymarket/btc-updown-5m/stream",
             }
         )
 
-    def stream_manifest(self, manifest: CanonicalWindowManifest):
-        if manifest.venue == Venue.HYPERLIQUID:
-            return iter(
-                [
-                    b'{"Market":{"Trade":{"instrument":{"Hyperliquid":{"market_type":"Perp","symbol":"BTC"}},"ts_ms":1,"px":100.0,"sz":0.1,"side":"Buy"}}}\n'
-                ]
-            )
-        return iter(
-            [
-                b'{"Market":{"Trade":{"instrument":{"Polymarket":{"symbol":"btc-updown-5m-1:Up"}},"ts_ms":1,"px":0.5,"sz":10.0,"side":"Buy"}}}\n'
-            ]
-        )
+    def get_shard_file(self, *, shard_id: str, file_name: str):
+        assert shard_id == "shard-1"
+        return (f"payload:{file_name}".encode("utf-8"), "application/vnd.apache.parquet")
 
 
 def test_post_replay_endpoints_are_deprecated() -> None:
@@ -88,7 +96,7 @@ def test_post_replay_endpoints_are_deprecated() -> None:
     assert client.post("/api/v1/polymarket/replays").status_code == 410
 
 
-def test_get_hyperliquid_manifest_and_stream() -> None:
+def test_get_hyperliquid_manifest_and_download_file() -> None:
     client = TestClient(create_app(Settings(), replay_service=FakeCanonicalReplayService()))
     manifest = client.get(
         "/api/v1/canonical/hyperliquid/perp/BTC",
@@ -96,17 +104,15 @@ def test_get_hyperliquid_manifest_and_stream() -> None:
     )
     assert manifest.status_code == 200
     assert manifest.json()["event_count"] == 2
+    assert manifest.json()["files_path_template"].endswith("/files/{file_name}")
 
-    stream = client.get(
-        "/api/v1/canonical/hyperliquid/perp/BTC/stream",
-        params={"start_date": "2026-02-19", "end_date": "2026-02-21", "depth": 20},
-    )
-    assert stream.status_code == 200
-    assert stream.headers["content-type"].startswith("application/x-ndjson")
-    assert '"Hyperliquid"' in stream.text
+    download = client.get("/api/v1/canonical/shards/shard-1/files/trades.parquet")
+    assert download.status_code == 200
+    assert download.headers["content-type"].startswith("application/vnd.apache.parquet")
+    assert download.content == b"payload:trades.parquet"
 
 
-def test_get_polymarket_manifest_and_stream() -> None:
+def test_get_polymarket_manifest_and_download_file() -> None:
     client = TestClient(create_app(Settings(), replay_service=FakeCanonicalReplayService()))
     manifest = client.get(
         "/api/v1/canonical/polymarket/btc-updown-5m",
@@ -120,14 +126,6 @@ def test_get_polymarket_manifest_and_stream() -> None:
     assert manifest.status_code == 200
     assert manifest.json()["series_key"] == "btc-updown-5m"
 
-    stream = client.get(
-        "/api/v1/canonical/polymarket/btc-updown-5m/stream",
-        params={
-            "start_date": "2026-02-19",
-            "end_date": "2026-02-21",
-            "outcomes": "both",
-            "depth": 5,
-        },
-    )
-    assert stream.status_code == 200
-    assert '"Polymarket"' in stream.text
+    download = client.get("/api/v1/canonical/shards/shard-1/files/books.parquet")
+    assert download.status_code == 200
+    assert download.content == b"payload:books.parquet"

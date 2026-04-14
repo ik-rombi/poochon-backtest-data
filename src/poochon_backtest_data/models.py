@@ -53,6 +53,12 @@ class CanonicalShardStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class CanonicalFileFamily(StrEnum):
+    BOOKS = "books"
+    TRADES = "trades"
+    CONTRACTS = "contracts"
+
+
 def _parse_date(value: str) -> date_cls:
     try:
         return date_cls.fromisoformat(value)
@@ -359,7 +365,7 @@ class CanonicalShardRecord(BaseModel):
     market_type: MarketType
     date: str
     depth: int
-    shard_s3_key: str
+    shard_prefix: str
     manifest_s3_key: str
     event_count: int = 0
     instrument: str | None = None
@@ -370,7 +376,30 @@ class CanonicalShardRecord(BaseModel):
     created_at: str
     updated_at: str
     source_refs: tuple[str, ...] = ()
+    files: tuple["CanonicalShardFile", ...] = ()
     error: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_legacy_aliases(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            if "shard_prefix" not in value:
+                shard_key = value.get("shard_s3_key") or value.get("manifest_s3_key")
+                if shard_key:
+                    prefix = str(shard_key).rsplit("/", 1)[0]
+                    value["shard_prefix"] = f"{prefix}/"
+            if "files" not in value:
+                value["files"] = ()
+        return value
+
+
+class CanonicalShardFile(BaseModel):
+    family: CanonicalFileFamily
+    file_name: str
+    s3_key: str
+    row_count: int
+    size_bytes: int = 0
 
 
 class CanonicalWindowManifest(BaseModel):
@@ -387,9 +416,9 @@ class CanonicalWindowManifest(BaseModel):
     start_ts_ms: int | None
     end_ts_ms: int | None
     shard_ids: tuple[str, ...]
-    shard_keys: tuple[str, ...]
+    shard_prefixes: tuple[str, ...]
     shards: tuple[CanonicalShardRecord, ...]
-    stream_path: str
+    files_path_template: str
 
 
 def utc_now_iso() -> str:
@@ -458,23 +487,19 @@ def canonical_polymarket_shard_id(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
-def canonical_hyperliquid_s3_key(market: MarketRef, date: str, depth: int) -> str:
+def canonical_hyperliquid_shard_prefix(market: MarketRef, date: str, depth: int) -> str:
     return (
         "canonical/hyperliquid/"
         f"market_type={market.market_type.value}/instrument={market.encoded_instrument()}/"
-        f"date={date}/depth={depth}/events.jsonl.zst"
+        f"date={date}/depth={depth}/"
     )
 
 
 def canonical_hyperliquid_manifest_s3_key(market: MarketRef, date: str, depth: int) -> str:
-    return (
-        "canonical/hyperliquid/"
-        f"market_type={market.market_type.value}/instrument={market.encoded_instrument()}/"
-        f"date={date}/depth={depth}/manifest.json"
-    )
+    return f"{canonical_hyperliquid_shard_prefix(market, date, depth)}manifest.json"
 
 
-def canonical_polymarket_s3_key(
+def canonical_polymarket_shard_prefix(
     *,
     series_key: str,
     date: str,
@@ -484,7 +509,7 @@ def canonical_polymarket_s3_key(
     return (
         "canonical/polymarket/"
         f"series={quote(series_key, safe='')}/outcomes={outcomes.value}/"
-        f"date={date}/depth={depth}/events.jsonl.zst"
+        f"date={date}/depth={depth}/"
     )
 
 
@@ -495,11 +520,15 @@ def canonical_polymarket_manifest_s3_key(
     outcomes: OutcomesMode,
     depth: int,
 ) -> str:
-    return (
-        "canonical/polymarket/"
-        f"series={quote(series_key, safe='')}/outcomes={outcomes.value}/"
-        f"date={date}/depth={depth}/manifest.json"
-    )
+    return f"{canonical_polymarket_shard_prefix(series_key=series_key, date=date, outcomes=outcomes, depth=depth)}manifest.json"
+
+
+def canonical_shard_family_file_name(family: CanonicalFileFamily) -> str:
+    return f"{family.value}.parquet"
+
+
+def canonical_shard_family_s3_key(shard_prefix: str, family: CanonicalFileFamily) -> str:
+    return f"{shard_prefix}{canonical_shard_family_file_name(family)}"
 
 
 def normalized_l2_s3_key(market: MarketRef, date: str, hour: int) -> str:

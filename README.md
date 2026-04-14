@@ -7,8 +7,8 @@ This repo owns the data plane that turns venue/provider data into deterministic 
 1. discover markets/contracts
 2. copy or download raw venue data into S3
 3. normalize raw data into a stable parquet schema
-4. materialize canonical replay shards as compressed NDJSON
-5. serve replay manifests and replay streams to consumers
+4. materialize canonical replay shards as typed Parquet families plus shard manifests
+5. serve replay window manifests and shard file downloads to consumers
 
 ## Stack Layout
 
@@ -35,9 +35,9 @@ Current dev stack defaults:
 Provider / Venue data
   -> raw S3 objects
   -> normalized parquet
-  -> canonical shard (events.jsonl.zst + manifest.json)
+  -> canonical shard (manifest.json + *.parquet families)
   -> canonical window manifest
-  -> NDJSON stream consumed by bitchon ReplaySource
+  -> Parquet family download consumed by bitchon ReplaySource
 ```
 
 There are two venue families today:
@@ -87,10 +87,13 @@ There are two venue families today:
   - `normalized/polymarket/kind=trade/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`
 - Canonical replay shards
   - Hyperliquid:
-    - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/events.jsonl.zst`
+    - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/trades.parquet`
+    - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/books.parquet`
     - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/manifest.json`
   - Polymarket:
-    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/events.jsonl.zst`
+    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/contracts.parquet`
+    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/trades.parquet`
+    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/books.parquet`
     - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/manifest.json`
 - Replay artifacts
   - `replays/.../events.jsonl.zst`
@@ -250,81 +253,62 @@ Semantics:
 
 ### Canonical Replay Stage
 
-Canonical replay is compressed NDJSON of domain events. This is the only format consumed by `bitchon` replay and backtest flows.
+Canonical replay is a manifest-rooted Parquet dataset. This is the only historical format consumed by `../bitchon/bot` replay and backtest flows.
 
-There are three event envelopes today.
+Each shard emits up to three typed family files.
 
-#### `Market.Trade`
+#### `trades.parquet`
 
 ```json
 {
-  "Market": {
-    "Trade": {
-      "instrument": {
-        "Polymarket": { "symbol": "btc-updown-5m-1771459200:Up" }
-      },
-      "ts_ms": 1771459201234,
-      "px": 0.5,
-      "sz": 10.0,
-      "side": "Buy"
-    }
-  }
+  "event_seq": 17,
+  "ts_ms": 1771459201234,
+  "instrument": "btc-updown-5m-1771459200:Up",
+  "px": 0.5,
+  "sz": 10.0,
+  "side": "Buy"
 }
 ```
 
-#### `Market.L2Snapshot`
+#### `books.parquet`
 
 ```json
 {
-  "Market": {
-    "L2Snapshot": {
-      "instrument": {
-        "Polymarket": { "symbol": "btc-updown-5m-1771459200:Up" }
-      },
-      "ts_ms": 1771459201234,
-      "bids": [{ "px": 0.49, "sz": 10.0, "level_count": 0 }],
-      "asks": [{ "px": 0.51, "sz": 11.0, "level_count": 0 }]
-    }
-  }
+  "event_seq": 18,
+  "ts_ms": 1771459201234,
+  "instrument": "btc-updown-5m-1771459200:Up",
+  "bid_px_0": 0.49,
+  "bid_sz_0": 10.0,
+  "bid_level_count_0": 0,
+  "ask_px_0": 0.51,
+  "ask_sz_0": 11.0,
+  "ask_level_count_0": 0
 }
 ```
 
-`bids` and `asks` are truncated to the requested canonical depth when the shard is built.
+Bid and ask columns are flattened per depth level and truncated to the requested canonical depth when the shard is built.
 
-#### `Contract.Polymarket`
+#### `contracts.parquet`
 
 ```json
 {
-  "Contract": {
-    "Polymarket": {
-      "kind": "ListedCurrent",
-      "ts_ms": 1771459201000,
-      "series_key": "btc-updown-5m",
-      "slug": "btc-updown-5m-1771459200",
-      "market_id": "0x...",
-      "start_ts_ms": 1771459200000,
-      "end_ts_ms": 1771459500000,
-      "price_to_beat": 66461.0,
-      "price_to_beat_source": "binance_us_open_1m",
-      "price_to_beat_quality": "proxy",
-      "outcomes": [
-        {
-          "outcome": "Down",
-          "asset_id": "8059...",
-          "instrument": {
-            "Polymarket": { "symbol": "btc-updown-5m-1771459200:Down" }
-          }
-        },
-        {
-          "outcome": "Up",
-          "asset_id": "9936...",
-          "instrument": {
-            "Polymarket": { "symbol": "btc-updown-5m-1771459200:Up" }
-          }
-        }
-      ]
-    }
-  }
+  "event_seq": 1,
+  "ts_ms": 1771459201000,
+  "kind": "ListedCurrent",
+  "series_key": "btc-updown-5m",
+  "slug": "btc-updown-5m-1771459200",
+  "market_id": "0x...",
+  "start_ts_ms": 1771459200000,
+  "end_ts_ms": 1771459500000,
+  "price_to_beat": 66461.0,
+  "price_to_beat_source": "binance_us_open_1m",
+  "price_to_beat_quality": "proxy",
+  "outcome_0": "Down",
+  "outcome_0_asset_id": "8059...",
+  "outcome_0_instrument": "btc-updown-5m-1771459200:Down",
+  "outcome_1": "Up",
+  "outcome_1_asset_id": "9936...",
+  "outcome_1_instrument": "btc-updown-5m-1771459200:Up"
 }
 ```
 
@@ -341,7 +325,7 @@ Contract lifecycle kinds:
 
 ### Polymarket Replay Contract Rules
 
-- replay streams only the current contract and the next contract for a `series_key`
+- replay exposes only the current contract and the next contract for a `series_key`
 - `series_key` is the slug family, for example `btc-updown-5m`
 - live and canonical replay are expected to follow the same lifecycle model
 - canonical builders derive the next contract by looking for the contract whose `start_ts_ms` is exactly one interval after the current contract
@@ -465,6 +449,6 @@ It must not remove `infra/core` storage:
 
 - raw provider payloads are not a consumer contract
 - normalized parquet is an internal data-plane contract
-- canonical replay NDJSON is the consumer-facing replay contract
+- canonical replay manifest + Parquet families are the consumer-facing replay contract
 
 If replay behavior changes, update this README first and keep `bitchon` live/replay semantics aligned.

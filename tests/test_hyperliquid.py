@@ -7,11 +7,11 @@ import lz4.frame
 import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
-import zstandard
 
 from poochon_backtest_data.canonical import build_hyperliquid_canonical_day
 from poochon_backtest_data.hyperliquid import collapse_fill_trades, trade_source_key
 from poochon_backtest_data.models import (
+    CanonicalFileFamily,
     CanonicalShardRecord,
     CoverageRecord,
     CoverageStatus,
@@ -76,6 +76,15 @@ def parquet_bytes(rows: list[dict], schema: pa.Schema) -> bytes:
     buffer = io.BytesIO()
     pq.write_table(table, buffer, compression="zstd")
     return buffer.getvalue()
+
+
+def canonical_rows(
+    store: FakeS3Store,
+    record: CanonicalShardRecord,
+    family: CanonicalFileFamily,
+) -> list[dict]:
+    file = next(item for item in record.files if item.family == family)
+    return pq.read_table(io.BytesIO(store.objects[file.s3_key])).to_pylist()
 
 
 def ready_coverage(dataset_kind: DatasetKind, market: MarketRef, date: str) -> CoverageRecord:
@@ -246,19 +255,22 @@ def test_build_hyperliquid_canonical_day_orders_trade_before_snapshot() -> None:
         shard_repo=shard_repo,
     )
 
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(store.objects[record.shard_s3_key])) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
-    first = orjson.loads(payload[0])
-    second = orjson.loads(payload[1])
-    assert first["Market"]["Trade"]["side"] == "Buy"
-    assert first["Market"]["Trade"]["instrument"] == {
-        "Hyperliquid": {"market_type": "Perp", "symbol": "BTC"}
-    }
-    assert second["Market"]["L2Snapshot"]["instrument"] == {
-        "Hyperliquid": {"market_type": "Perp", "symbol": "BTC"}
-    }
-    assert second["Market"]["L2Snapshot"]["bids"][0]["level_count"] == 2
-    assert len(second["Market"]["L2Snapshot"]["bids"]) == 1
+    trades = canonical_rows(store, record, CanonicalFileFamily.TRADES)
+    books = canonical_rows(store, record, CanonicalFileFamily.BOOKS)
+    assert trades == [
+        {
+            "event_seq": 0,
+            "ts_ms": 1000,
+            "instrument": "BTC",
+            "side": "Buy",
+            "px": 100.5,
+            "sz": 0.25,
+        }
+    ]
+    assert books[0]["event_seq"] == 1
+    assert books[0]["instrument"] == "BTC"
+    assert books[0]["bid_level_count_0"] == 2
+    assert books[0]["bid_px_0"] == 100.0
 
 
 def test_build_hyperliquid_canonical_day_force_rewrites_existing_shard() -> None:
@@ -343,7 +355,8 @@ def test_build_hyperliquid_canonical_day_force_rewrites_existing_shard() -> None
         coverage_repo=coverage,
         shard_repo=shard_repo,
     )
-    before = store.objects[record.shard_s3_key]
+    trade_file = next(item for item in record.files if item.family == CanonicalFileFamily.TRADES)
+    before = store.objects[trade_file.s3_key]
 
     store.objects[normalized_trade_s3_key(market, date, 0)] = parquet_bytes(
         [
@@ -371,9 +384,12 @@ def test_build_hyperliquid_canonical_day_force_rewrites_existing_shard() -> None
         force=True,
     )
 
-    after = store.objects[record.shard_s3_key]
+    updated = shard_repo.get(record.shard_id)
+    assert updated is not None
+    updated_trade_file = next(
+        item for item in updated.files if item.family == CanonicalFileFamily.TRADES
+    )
+    after = store.objects[updated_trade_file.s3_key]
     assert after != before
-    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(after)) as reader:
-        payload = reader.read().decode("utf-8").strip().splitlines()
-    first = orjson.loads(payload[0])
-    assert first["Market"]["Trade"]["px"] == 101.5
+    rows = pq.read_table(io.BytesIO(after)).to_pylist()
+    assert rows[0]["px"] == 101.5

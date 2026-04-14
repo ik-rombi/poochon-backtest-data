@@ -6,16 +6,21 @@ from datetime import UTC, date as date_cls, datetime
 import heapq
 import io
 import logging
+import os
 from pathlib import Path
+import tempfile
 from time import perf_counter
 from typing import Any, Callable, Iterator
 from urllib.parse import unquote
 
 import orjson
+import pyarrow as pa
 import pyarrow.parquet as pq
 import zstandard
 
 from .models import (
+    CanonicalFileFamily,
+    CanonicalShardFile,
     CanonicalShardRecord,
     CanonicalShardStatus,
     CoverageRecord,
@@ -27,11 +32,13 @@ from .models import (
     PolymarketMarketResolution,
     Venue,
     canonical_hyperliquid_manifest_s3_key,
-    canonical_hyperliquid_s3_key,
+    canonical_hyperliquid_shard_prefix,
     canonical_hyperliquid_shard_id,
     canonical_polymarket_manifest_s3_key,
-    canonical_polymarket_s3_key,
+    canonical_polymarket_shard_prefix,
     canonical_polymarket_shard_id,
+    canonical_shard_family_file_name,
+    canonical_shard_family_s3_key,
     coverage_pk,
     normalized_l2_s3_key,
     normalized_trade_s3_key,
@@ -144,6 +151,233 @@ def _iter_parquet_rows(
             if filter_fn is not None and not filter_fn(row):
                 continue
             yield {**row, **extra_fields}
+
+
+def _trade_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            ("event_seq", pa.int64()),
+            ("ts_ms", pa.int64()),
+            ("instrument", pa.string()),
+            ("side", pa.string()),
+            ("px", pa.float64()),
+            ("sz", pa.float64()),
+        ]
+    )
+
+
+def _book_schema(depth: int) -> pa.Schema:
+    fields: list[pa.Field] = [
+        pa.field("event_seq", pa.int64()),
+        pa.field("ts_ms", pa.int64()),
+        pa.field("instrument", pa.string()),
+    ]
+    for side in ("bid", "ask"):
+        for index in range(depth):
+            fields.extend(
+                [
+                    pa.field(f"{side}_px_{index}", pa.float64()),
+                    pa.field(f"{side}_sz_{index}", pa.float64()),
+                    pa.field(f"{side}_level_count_{index}", pa.int32()),
+                ]
+            )
+    return pa.schema(fields)
+
+
+def _contract_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            ("event_seq", pa.int64()),
+            ("ts_ms", pa.int64()),
+            ("kind", pa.string()),
+            ("series_key", pa.string()),
+            ("slug", pa.string()),
+            ("market_id", pa.string()),
+            ("start_ts_ms", pa.int64()),
+            ("end_ts_ms", pa.int64()),
+            ("price_to_beat", pa.float64()),
+            ("price_to_beat_source", pa.string()),
+            ("price_to_beat_quality", pa.string()),
+            ("outcome_0", pa.string()),
+            ("outcome_0_asset_id", pa.string()),
+            ("outcome_0_instrument", pa.string()),
+            ("outcome_1", pa.string()),
+            ("outcome_1_asset_id", pa.string()),
+            ("outcome_1_instrument", pa.string()),
+        ]
+    )
+
+
+def _decode_book_levels(raw_levels: str, *, depth: int) -> list[dict[str, Any]]:
+    levels = orjson.loads(raw_levels)
+    if not isinstance(levels, list):
+        return []
+    return [
+        {
+            "px": float(level["px"]),
+            "sz": float(level["sz"]),
+            "level_count": int(level.get("n", 0)),
+        }
+        for level in levels[:depth]
+    ]
+
+
+def _book_row(row: dict[str, Any], *, event_seq: int, depth: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "event_seq": event_seq,
+        "ts_ms": int(row["ts_ms"]),
+        "instrument": str(row["instrument"]),
+    }
+    bids = _decode_book_levels(row["bids_json"], depth=depth)
+    asks = _decode_book_levels(row["asks_json"], depth=depth)
+    for side, levels in (("bid", bids), ("ask", asks)):
+        for index in range(depth):
+            level = levels[index] if index < len(levels) else None
+            payload[f"{side}_px_{index}"] = None if level is None else level["px"]
+            payload[f"{side}_sz_{index}"] = None if level is None else level["sz"]
+            payload[f"{side}_level_count_{index}"] = (
+                None if level is None else level["level_count"]
+            )
+    return payload
+
+
+def _trade_row(row: dict[str, Any], *, event_seq: int) -> dict[str, Any]:
+    return {
+        "event_seq": event_seq,
+        "ts_ms": int(row["ts_ms"]),
+        "instrument": str(row["instrument"]),
+        "side": str(row["side"]),
+        "px": float(row["px"]),
+        "sz": float(row["sz"]),
+    }
+
+
+def _contract_row(event: dict[str, Any], *, event_seq: int) -> dict[str, Any]:
+    payload = event["Contract"]["Polymarket"]
+    outcomes = payload["outcomes"]
+    first = outcomes[0]
+    second = outcomes[1] if len(outcomes) > 1 else None
+    return {
+        "event_seq": event_seq,
+        "ts_ms": int(payload["ts_ms"]),
+        "kind": str(payload["kind"]),
+        "series_key": str(payload["series_key"]),
+        "slug": str(payload["slug"]),
+        "market_id": str(payload["market_id"]),
+        "start_ts_ms": int(payload["start_ts_ms"]),
+        "end_ts_ms": int(payload["end_ts_ms"]),
+        "price_to_beat": payload["price_to_beat"],
+        "price_to_beat_source": payload["price_to_beat_source"],
+        "price_to_beat_quality": payload["price_to_beat_quality"],
+        "outcome_0": str(first["outcome"]),
+        "outcome_0_asset_id": str(first["asset_id"]),
+        "outcome_0_instrument": str(first["instrument"]["Polymarket"]["symbol"]),
+        "outcome_1": None if second is None else str(second["outcome"]),
+        "outcome_1_asset_id": None if second is None else str(second["asset_id"]),
+        "outcome_1_instrument": (
+            None
+            if second is None
+            else str(second["instrument"]["Polymarket"]["symbol"])
+        ),
+    }
+
+
+class _ParquetFamilyWriter:
+    def __init__(self, *, path: Path, schema: pa.Schema):
+        self.path = path
+        self.schema = schema
+        self.rows: list[dict[str, Any]] = []
+        self.row_count = 0
+        self.writer: pq.ParquetWriter | None = None
+
+    def write(self, row: dict[str, Any]) -> None:
+        self.rows.append(row)
+        if len(self.rows) >= 4096:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.rows:
+            return
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(
+                self.path,
+                self.schema,
+                compression="snappy",
+                use_dictionary=False,
+            )
+        table = pa.Table.from_pylist(self.rows, schema=self.schema)
+        self.writer.write_table(table)
+        self.row_count += len(self.rows)
+        self.rows.clear()
+
+    def close(self) -> None:
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(
+                self.path,
+                self.schema,
+                compression="snappy",
+                use_dictionary=False,
+            )
+        self.flush()
+        self.writer.close()
+        self.writer = None
+
+
+class _CanonicalShardParquetWriter:
+    def __init__(
+        self,
+        *,
+        temp_dir: Path,
+        shard_prefix: str,
+        depth: int,
+        families: tuple[CanonicalFileFamily, ...],
+    ):
+        self.shard_prefix = shard_prefix
+        self.families = families
+        self.writers: dict[CanonicalFileFamily, _ParquetFamilyWriter] = {}
+        for family in families:
+            path = temp_dir / canonical_shard_family_file_name(family)
+            if family == CanonicalFileFamily.TRADES:
+                schema = _trade_schema()
+            elif family == CanonicalFileFamily.BOOKS:
+                schema = _book_schema(depth)
+            elif family == CanonicalFileFamily.CONTRACTS:
+                schema = _contract_schema()
+            else:
+                raise ValueError(f"unsupported canonical family: {family}")
+            self.writers[family] = _ParquetFamilyWriter(path=path, schema=schema)
+
+    def write_trade(self, row: dict[str, Any], *, event_seq: int) -> None:
+        self.writers[CanonicalFileFamily.TRADES].write(_trade_row(row, event_seq=event_seq))
+
+    def write_book(self, row: dict[str, Any], *, event_seq: int, depth: int) -> None:
+        self.writers[CanonicalFileFamily.BOOKS].write(
+            _book_row(row, event_seq=event_seq, depth=depth)
+        )
+
+    def write_contract(self, event: dict[str, Any], *, event_seq: int) -> None:
+        if CanonicalFileFamily.CONTRACTS not in self.writers:
+            raise ValueError("contract writer is not configured for this shard")
+        self.writers[CanonicalFileFamily.CONTRACTS].write(
+            _contract_row(event, event_seq=event_seq)
+        )
+
+    def close(self) -> tuple[CanonicalShardFile, ...]:
+        files: list[CanonicalShardFile] = []
+        for family in self.families:
+            writer = self.writers[family]
+            writer.close()
+            file_name = canonical_shard_family_file_name(family)
+            files.append(
+                CanonicalShardFile(
+                    family=family,
+                    file_name=file_name,
+                    s3_key=canonical_shard_family_s3_key(self.shard_prefix, family),
+                    row_count=writer.row_count,
+                    size_bytes=os.path.getsize(writer.path),
+                )
+            )
+        return tuple(files)
 
 
 @dataclass
@@ -709,10 +943,24 @@ def _iter_polymarket_window_rows(
         yield from _merge_sorted_streams(streams)
 
 
+def _canonical_shard_exists(
+    existing: CanonicalShardRecord | None,
+    *,
+    s3_store: S3Store,
+) -> bool:
+    if existing is None or existing.status != CanonicalShardStatus.READY:
+        return False
+    if not s3_store.exists(existing.manifest_s3_key):
+        return False
+    if not existing.files:
+        return False
+    return all(s3_store.exists(file.s3_key) for file in existing.files)
+
+
 def _build_polymarket_shard(
     *,
     shard_id: str,
-    shard_key: str,
+    shard_prefix: str,
     manifest_key: str,
     date: str,
     series_key: str,
@@ -741,7 +989,7 @@ def _build_polymarket_shard(
     )
     record = _materialize_polymarket_shard(
         shard_id=shard_id,
-        shard_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_key=manifest_key,
         series_key=series_key,
         outcomes=outcomes.value,
@@ -778,7 +1026,7 @@ def _build_polymarket_shard(
 def _materialize_polymarket_shard(
     *,
     shard_id: str,
-    shard_key: str,
+    shard_prefix: str,
     manifest_key: str,
     date: str,
     series_key: str,
@@ -793,83 +1041,76 @@ def _materialize_polymarket_shard(
     stats: _PolymarketBuildStats | None = None,
 ) -> CanonicalShardRecord:
     existing = shard_repo.get(shard_id)
-    if (
-        not force
-        and existing is not None
-        and existing.status == CanonicalShardStatus.READY
-        and s3_store.exists(existing.shard_s3_key)
-    ):
+    if not force and _canonical_shard_exists(existing, s3_store=s3_store):
         return existing
 
-    temp_path = f"/tmp/{shard_id}.jsonl.zst"
     event_count = 0
     start_ts_ms: int | None = None
     end_ts_ms: int | None = None
     schedule = _PolymarketContractSchedule(contracts)
     emit_started_at = perf_counter()
+    with tempfile.TemporaryDirectory(prefix=f"{shard_id}-") as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        writers = _CanonicalShardParquetWriter(
+            temp_dir=temp_dir,
+            shard_prefix=shard_prefix,
+            depth=depth,
+            families=(
+                CanonicalFileFamily.CONTRACTS,
+                CanonicalFileFamily.TRADES,
+                CanonicalFileFamily.BOOKS,
+            ),
+        )
+        event_seq = 0
 
-    with open(temp_path, "wb") as raw_file:
-        with zstandard.ZstdCompressor(level=3).stream_writer(raw_file) as writer:
-            for merged in merged_rows:
-                row = merged.row
-                ts_ms = int(row["ts_ms"])
-                for event in schedule.lifecycle_events(ts_ms):
-                    if start_ts_ms is None:
-                        start_ts_ms = ts_ms
-                    end_ts_ms = ts_ms
-                    writer.write(orjson.dumps(event))
-                    writer.write(b"\n")
-                    event_count += 1
-                    if stats is not None:
-                        stats.rows_emitted += 1
-
+        for merged in merged_rows:
+            row = merged.row
+            ts_ms = int(row["ts_ms"])
+            for event in schedule.lifecycle_events(ts_ms):
                 if start_ts_ms is None:
                     start_ts_ms = ts_ms
                 end_ts_ms = ts_ms
-                if merged.kind == "trade":
-                    writer.write(orjson.dumps(_trade_event(row)))
-                else:
-                    writer.write(orjson.dumps(_snapshot_event(row, depth=depth)))
-                writer.write(b"\n")
+                writers.write_contract(event, event_seq=event_seq)
+                event_seq += 1
                 event_count += 1
                 if stats is not None:
                     stats.rows_emitted += 1
 
-            if event_count == 0 and contracts:
-                ts_ms = contracts[0].start_ts_ms
-                for event in schedule.lifecycle_events(ts_ms):
-                    if start_ts_ms is None:
-                        start_ts_ms = ts_ms
-                    end_ts_ms = ts_ms
-                    writer.write(orjson.dumps(event))
-                    writer.write(b"\n")
-                    event_count += 1
-                    if stats is not None:
-                        stats.rows_emitted += 1
+            if start_ts_ms is None:
+                start_ts_ms = ts_ms
+            end_ts_ms = ts_ms
+            if merged.kind == "trade":
+                writers.write_trade(row, event_seq=event_seq)
+            else:
+                writers.write_book(row, event_seq=event_seq, depth=depth)
+            event_seq += 1
+            event_count += 1
+            if stats is not None:
+                stats.rows_emitted += 1
+
+        if event_count == 0 and contracts:
+            ts_ms = contracts[0].start_ts_ms
+            for event in schedule.lifecycle_events(ts_ms):
+                if start_ts_ms is None:
+                    start_ts_ms = ts_ms
+                end_ts_ms = ts_ms
+                writers.write_contract(event, event_seq=event_seq)
+                event_seq += 1
+                event_count += 1
+                if stats is not None:
+                    stats.rows_emitted += 1
+
+        files = writers.close()
+        for file in files:
+            s3_store.put_file(
+                file.s3_key,
+                str(temp_dir / file.file_name),
+                content_type="application/vnd.apache.parquet",
+            )
     if stats is not None:
         stats.emit_seconds += perf_counter() - emit_started_at
 
-    s3_store.put_file(shard_key, temp_path, content_type="application/zstd")
     created_at = utc_now_iso()
-    s3_store.put_json(
-        manifest_key,
-        {
-            "shard_id": shard_id,
-            "venue": Venue.POLYMARKET.value,
-            "market_type": MarketType.BINARY.value,
-            "instrument": None,
-            "series_key": series_key,
-            "outcomes": outcomes,
-            "date": date,
-            "depth": depth,
-            "event_count": event_count,
-            "start_ts_ms": start_ts_ms,
-            "end_ts_ms": end_ts_ms,
-            "shard_s3_key": shard_key,
-            "source_refs": source_refs,
-            "created_at": created_at,
-        },
-    )
     record = CanonicalShardRecord(
         shard_id=shard_id,
         status=CanonicalShardStatus.READY,
@@ -880,14 +1121,17 @@ def _materialize_polymarket_shard(
         outcomes=outcomes,
         date=date,
         depth=depth,
-        shard_s3_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_s3_key=manifest_key,
         event_count=event_count,
         start_ts_ms=start_ts_ms,
         end_ts_ms=end_ts_ms,
         created_at=created_at,
         updated_at=created_at,
+        source_refs=tuple(source_refs),
+        files=files,
     )
+    s3_store.put_json(manifest_key, record.model_dump(mode="json"))
     shard_repo.put(record)
     return record
 
@@ -895,7 +1139,7 @@ def _materialize_polymarket_shard(
 def _materialize_shard(
     *,
     shard_id: str,
-    shard_key: str,
+    shard_prefix: str,
     manifest_key: str,
     venue: Venue,
     market_type,
@@ -911,56 +1155,45 @@ def _materialize_shard(
     force: bool = False,
 ) -> CanonicalShardRecord:
     existing = shard_repo.get(shard_id)
-    if (
-        not force
-        and existing is not None
-        and existing.status == CanonicalShardStatus.READY
-        and s3_store.exists(
-        existing.shard_s3_key
-        )
-    ):
+    if not force and _canonical_shard_exists(existing, s3_store=s3_store):
         return existing
 
-    temp_path = f"/tmp/{shard_id}.jsonl.zst"
     event_count = 0
     start_ts_ms: int | None = None
     end_ts_ms: int | None = None
-    with open(temp_path, "wb") as raw_file:
-        with zstandard.ZstdCompressor(level=3).stream_writer(raw_file) as writer:
-            for merged in merged_rows:
-                row = merged.row
-                ts_ms = int(row["ts_ms"])
-                if start_ts_ms is None:
-                    start_ts_ms = ts_ms
-                end_ts_ms = ts_ms
-                if merged.kind == "trade":
-                    writer.write(orjson.dumps(_trade_event(row)))
-                else:
-                    writer.write(orjson.dumps(_snapshot_event(row, depth=depth)))
-                writer.write(b"\n")
-                event_count += 1
+    with tempfile.TemporaryDirectory(prefix=f"{shard_id}-") as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        writers = _CanonicalShardParquetWriter(
+            temp_dir=temp_dir,
+            shard_prefix=shard_prefix,
+            depth=depth,
+            families=(
+                CanonicalFileFamily.TRADES,
+                CanonicalFileFamily.BOOKS,
+            ),
+        )
+        event_seq = 0
+        for merged in merged_rows:
+            row = merged.row
+            ts_ms = int(row["ts_ms"])
+            if start_ts_ms is None:
+                start_ts_ms = ts_ms
+            end_ts_ms = ts_ms
+            if merged.kind == "trade":
+                writers.write_trade(row, event_seq=event_seq)
+            else:
+                writers.write_book(row, event_seq=event_seq, depth=depth)
+            event_seq += 1
+            event_count += 1
+        files = writers.close()
+        for file in files:
+            s3_store.put_file(
+                file.s3_key,
+                str(temp_dir / file.file_name),
+                content_type="application/vnd.apache.parquet",
+            )
 
-    s3_store.put_file(shard_key, temp_path, content_type="application/zstd")
     created_at = utc_now_iso()
-    s3_store.put_json(
-        manifest_key,
-        {
-            "shard_id": shard_id,
-            "venue": venue.value,
-            "market_type": market_type.value,
-            "instrument": instrument,
-            "series_key": series_key,
-            "outcomes": outcomes,
-            "date": date,
-            "depth": depth,
-            "event_count": event_count,
-            "start_ts_ms": start_ts_ms,
-            "end_ts_ms": end_ts_ms,
-            "shard_s3_key": shard_key,
-            "source_refs": source_refs,
-            "created_at": created_at,
-        },
-    )
     record = CanonicalShardRecord(
         shard_id=shard_id,
         status=CanonicalShardStatus.READY,
@@ -971,14 +1204,17 @@ def _materialize_shard(
         outcomes=outcomes,
         date=date,
         depth=depth,
-        shard_s3_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_s3_key=manifest_key,
         event_count=event_count,
         start_ts_ms=start_ts_ms,
         end_ts_ms=end_ts_ms,
         created_at=created_at,
         updated_at=created_at,
+        source_refs=tuple(source_refs),
+        files=files,
     )
+    s3_store.put_json(manifest_key, record.model_dump(mode="json"))
     shard_repo.put(record)
     return record
 
@@ -986,7 +1222,7 @@ def _materialize_shard(
 def _build_shard(
     *,
     shard_id: str,
-    shard_key: str,
+    shard_prefix: str,
     manifest_key: str,
     venue: Venue,
     market_type,
@@ -1003,7 +1239,7 @@ def _build_shard(
 ) -> CanonicalShardRecord:
     return _materialize_shard(
         shard_id=shard_id,
-        shard_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_key=manifest_key,
         venue=venue,
         market_type=market_type,
@@ -1038,7 +1274,7 @@ def build_hyperliquid_canonical_day(
         raise ValueError(f"normalized trade coverage is not ready for {market.instrument} {date}")
 
     shard_id = canonical_hyperliquid_shard_id(market, date, depth)
-    shard_key = canonical_hyperliquid_s3_key(market, date, depth)
+    shard_prefix = canonical_hyperliquid_shard_prefix(market, date, depth)
     manifest_key = canonical_hyperliquid_manifest_s3_key(market, date, depth)
     streams: list[_MergeStream] = []
     source_refs: list[str] = []
@@ -1085,7 +1321,7 @@ def build_hyperliquid_canonical_day(
 
     return _build_shard(
         shard_id=shard_id,
-        shard_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_key=manifest_key,
         venue=market.venue,
         market_type=market.market_type,
@@ -1124,7 +1360,7 @@ def build_polymarket_canonical_day(
         outcomes=outcomes,
         depth=depth,
     )
-    shard_key = canonical_polymarket_s3_key(
+    shard_prefix = canonical_polymarket_shard_prefix(
         series_key=series_key,
         date=date,
         outcomes=outcomes,
@@ -1154,7 +1390,7 @@ def build_polymarket_canonical_day(
 
     return _build_polymarket_shard(
         shard_id=shard_id,
-        shard_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_key=manifest_key,
         date=date,
         series_key=series_key,
@@ -1378,7 +1614,7 @@ def build_polymarket_canonical_day_from_storage(
         outcomes=outcomes,
         depth=depth,
     )
-    shard_key = canonical_polymarket_s3_key(
+    shard_prefix = canonical_polymarket_shard_prefix(
         series_key=series_key,
         date=date,
         outcomes=outcomes,
@@ -1408,7 +1644,7 @@ def build_polymarket_canonical_day_from_storage(
 
     return _build_polymarket_shard(
         shard_id=shard_id,
-        shard_key=shard_key,
+        shard_prefix=shard_prefix,
         manifest_key=manifest_key,
         date=date,
         series_key=series_key,
