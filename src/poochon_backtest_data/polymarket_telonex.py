@@ -182,6 +182,7 @@ def _resolution_from_payload(
     outcome: str,
     *,
     price_to_beat: PriceToBeat | None = None,
+    settlement_payout: float | None = None,
 ) -> PolymarketMarketResolution:
     outcomes = _parse_json_list(payload["outcomes"])
     token_ids = _parse_json_list(payload["clobTokenIds"])
@@ -206,7 +207,63 @@ def _resolution_from_payload(
         price_to_beat=None if price_to_beat is None else price_to_beat.price,
         price_to_beat_source=None if price_to_beat is None else price_to_beat.source,
         price_to_beat_quality=None if price_to_beat is None else price_to_beat.quality,
+        settlement_payout=settlement_payout,
     )
+
+
+def _settlement_payout_from_payload(
+    payload: dict[str, Any],
+    outcome: str,
+    *,
+    price_to_beat: PriceToBeat | None = None,
+    settlement_price: PriceToBeat | None = None,
+) -> float | None:
+    winning_outcome = payload.get("winningOutcome")
+    if isinstance(winning_outcome, str) and winning_outcome:
+        return 1.0 if outcome == winning_outcome else 0.0
+
+    outcome_prices = payload.get("outcomePrices")
+    if isinstance(outcome_prices, str):
+        parsed = orjson.loads(outcome_prices)
+        outcome_prices = parsed if isinstance(parsed, list) else None
+    if isinstance(outcome_prices, list):
+        raw_outcomes = payload.get("outcomes")
+        if isinstance(raw_outcomes, str):
+            outcomes = _parse_json_list(raw_outcomes)
+        elif isinstance(raw_outcomes, list):
+            outcomes = [str(value) for value in raw_outcomes]
+        else:
+            outcomes = []
+        if outcome in outcomes:
+            outcome_index = outcomes.index(outcome)
+            if outcome_index < len(outcome_prices):
+                try:
+                    return float(outcome_prices[outcome_index])
+                except (TypeError, ValueError):
+                    pass
+
+    tokens = payload.get("tokens")
+    if isinstance(tokens, list):
+        for token in tokens:
+            if not isinstance(token, dict):
+                continue
+            if str(token.get("outcome")) != outcome:
+                continue
+            winner = token.get("winner")
+            if isinstance(winner, bool):
+                return 1.0 if winner else 0.0
+
+    if price_to_beat is None or settlement_price is None:
+        return None
+    series_key = _series_key_from_slug(str(payload["slug"])).lower()
+    if "5m" not in series_key:
+        return None
+    if outcome not in {"Up", "Down"}:
+        return None
+    if settlement_price.price == price_to_beat.price:
+        return None
+    winning_outcome = "Up" if settlement_price.price > price_to_beat.price else "Down"
+    return 1.0 if outcome == winning_outcome else 0.0
 
 
 def _asset_from_series_key(series_key: str) -> str:
@@ -318,16 +375,31 @@ def resolve_market(
         response = http.get(f"{GAMMA_BASE_URL}/markets/slug/{request.slug}")
         response.raise_for_status()
         payload = response.json()
-        _, _, start_ts_ms, _ = _contract_window_from_payload(payload)
+        _, _, start_ts_ms, end_ts_ms = _contract_window_from_payload(payload)
         price_to_beat = _fetch_price_to_beat(
             http,
             slug=str(payload["slug"]),
             start_ts_ms=start_ts_ms,
         )
+        settlement_price = _fetch_price_to_beat(
+            http,
+            slug=str(payload["slug"]),
+            start_ts_ms=end_ts_ms,
+        )
     finally:
         if own_client:
             http.close()
-    return _resolution_from_payload(payload, request.outcome, price_to_beat=price_to_beat)
+    return _resolution_from_payload(
+        payload,
+        request.outcome,
+        price_to_beat=price_to_beat,
+        settlement_payout=_settlement_payout_from_payload(
+            payload,
+            request.outcome,
+            price_to_beat=price_to_beat,
+            settlement_price=settlement_price,
+        ),
+    )
 
 
 def _put_coverage(
@@ -698,7 +770,7 @@ def discover_series_markets(
                 continue
             response.raise_for_status()
             payload = response.json()
-            start, end, start_ts_ms, _ = _contract_window_from_payload(payload)
+            start, end, start_ts_ms, end_ts_ms = _contract_window_from_payload(payload)
             if end < window_start or start > window_end:
                 continue
             price_to_beat = _fetch_price_to_beat(
@@ -706,11 +778,22 @@ def discover_series_markets(
                 slug=str(payload["slug"]),
                 start_ts_ms=start_ts_ms,
             )
+            settlement_price = _fetch_price_to_beat(
+                http,
+                slug=str(payload["slug"]),
+                start_ts_ms=end_ts_ms,
+            )
             for outcome in ("Up", "Down"):
                 resolution = _resolution_from_payload(
                     payload,
                     outcome,
                     price_to_beat=price_to_beat,
+                    settlement_payout=_settlement_payout_from_payload(
+                        payload,
+                        outcome,
+                        price_to_beat=price_to_beat,
+                        settlement_price=settlement_price,
+                    ),
                 )
                 key = (resolution.slug, resolution.outcome)
                 if key in seen:

@@ -201,9 +201,11 @@ def _contract_schema() -> pa.Schema:
             ("outcome_0", pa.string()),
             ("outcome_0_asset_id", pa.string()),
             ("outcome_0_instrument", pa.string()),
+            ("outcome_0_settlement_payout", pa.float64()),
             ("outcome_1", pa.string()),
             ("outcome_1_asset_id", pa.string()),
             ("outcome_1_instrument", pa.string()),
+            ("outcome_1_settlement_payout", pa.float64()),
         ]
     )
 
@@ -272,12 +274,16 @@ def _contract_row(event: dict[str, Any], *, event_seq: int) -> dict[str, Any]:
         "outcome_0": str(first["outcome"]),
         "outcome_0_asset_id": str(first["asset_id"]),
         "outcome_0_instrument": str(first["instrument"]["Polymarket"]["symbol"]),
+        "outcome_0_settlement_payout": first.get("settlement_payout"),
         "outcome_1": None if second is None else str(second["outcome"]),
         "outcome_1_asset_id": None if second is None else str(second["asset_id"]),
         "outcome_1_instrument": (
             None
             if second is None
             else str(second["instrument"]["Polymarket"]["symbol"])
+        ),
+        "outcome_1_settlement_payout": (
+            None if second is None else second.get("settlement_payout")
         ),
     }
 
@@ -441,6 +447,7 @@ class _PolymarketContractOutcome:
     outcome: str
     asset_id: str
     instrument: str
+    settlement_payout: float | None
 
 
 @dataclass(frozen=True)
@@ -477,6 +484,7 @@ class _PolymarketContract:
                                 venue=Venue.POLYMARKET,
                                 instrument=item.instrument,
                             ),
+                            "settlement_payout": item.settlement_payout,
                         }
                         for item in self.outcomes
                     ],
@@ -572,6 +580,7 @@ def _group_polymarket_contracts(
                         outcome=item.outcome,
                         asset_id=item.asset_id,
                         instrument=item.instrument,
+                        settlement_payout=item.settlement_payout,
                     )
                     for item in sorted(items, key=lambda item: item.outcome)
                 ),

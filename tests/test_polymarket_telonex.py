@@ -219,6 +219,8 @@ def market_payload(
     *,
     start_date: str = "2026-02-19T00:00:00Z",
     end_date: str = "2026-02-20T00:00:00Z",
+    winning_outcome: str | None = None,
+    outcome_prices: list[str] | None = None,
 ) -> dict:
     return {
         "slug": slug,
@@ -228,6 +230,8 @@ def market_payload(
         "clobTokenIds": '["asset-up","asset-down"]',
         "startDate": start_date,
         "endDate": end_date,
+        "winningOutcome": winning_outcome,
+        "outcomePrices": outcome_prices,
     }
 
 
@@ -346,6 +350,90 @@ def test_resolve_market_falls_back_to_binance_for_price_to_beat() -> None:
     assert resolution.price_to_beat == 65999.5
     assert resolution.price_to_beat_source == "binance_open_1m"
     assert resolution.price_to_beat_quality == "proxy"
+    client.close()
+
+
+def test_resolve_market_sets_settlement_payout_from_winning_outcome() -> None:
+    client = mock_client(
+        {
+            "btc-updown-5m-1775181000": market_payload(
+                "btc-updown-5m-1775181000",
+                winning_outcome="Down",
+            )
+        },
+        binance={("BTCUSDT", 1775181000000): [[1775181000000, "65999.5"]]},
+    )
+
+    up = resolve_market(
+        PolymarketReplayCreateRequest(slug="btc-updown-5m-1775181000", outcome="Up"),
+        client=client,
+    )
+    down = resolve_market(
+        PolymarketReplayCreateRequest(slug="btc-updown-5m-1775181000", outcome="Down"),
+        client=client,
+    )
+
+    assert up.settlement_payout == 0.0
+    assert down.settlement_payout == 1.0
+    client.close()
+
+
+def test_resolve_market_sets_settlement_payout_from_outcome_prices() -> None:
+    client = mock_client(
+        {
+            "btc-updown-5m-1775181000": market_payload(
+                "btc-updown-5m-1775181000",
+                outcome_prices=["0", "1"],
+            )
+        },
+        binance={("BTCUSDT", 1775181000000): [[1775181000000, "65999.5"]]},
+    )
+
+    up = resolve_market(
+        PolymarketReplayCreateRequest(slug="btc-updown-5m-1775181000", outcome="Up"),
+        client=client,
+    )
+    down = resolve_market(
+        PolymarketReplayCreateRequest(slug="btc-updown-5m-1775181000", outcome="Down"),
+        client=client,
+    )
+
+    assert up.settlement_payout == 0.0
+    assert down.settlement_payout == 1.0
+    client.close()
+
+
+def test_discover_series_markets_derives_settlement_payout_from_reference_prices(monkeypatch) -> None:
+    monkeypatch.setattr(
+        polymarket_telonex,
+        "_iter_series_candidate_slugs",
+        lambda series, start_date, end_date: ["btc-updown-5m-1771459200"],
+    )
+    client = mock_client(
+        {
+            "btc-updown-5m-1771459200": market_payload(
+                "btc-updown-5m-1771459200",
+                start_date="2026-02-18T00:08:38.273Z",
+                end_date="2026-02-20T00:00:00Z",
+            )
+        },
+        vatic={
+            ("btc", 1771459200): {"price": 66000.0},
+            ("btc", 1771459500): {"price": 66012.0},
+        },
+    )
+
+    resolutions = discover_series_markets(
+        PolymarketSeriesSyncRequest(
+            series="btc-updown-5m",
+            start_date="2026-02-19",
+            end_date="2026-02-19",
+        ),
+        client=client,
+    )
+
+    payouts = {item.outcome: item.settlement_payout for item in resolutions}
+    assert payouts == {"Up": 1.0, "Down": 0.0}
     client.close()
 
 

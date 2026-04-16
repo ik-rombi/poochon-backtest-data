@@ -278,6 +278,7 @@ class PolymarketMarketResolution(BaseModel):
     price_to_beat: float | None = None
     price_to_beat_source: str | None = None
     price_to_beat_quality: str | None = None
+    settlement_payout: float | None = None
 
     @model_validator(mode="after")
     def validate_resolution(self) -> "PolymarketMarketResolution":
