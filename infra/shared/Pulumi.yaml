@@ -1,0 +1,4 @@
+name: poochon-backtest-data-shared
+runtime:
+  name: python
+description: Shared networking/compute plumbing (VPC, cluster, ECR, IAM) reused by write and read stacks.

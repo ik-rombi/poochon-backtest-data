@@ -12,22 +12,53 @@ This repo owns the data plane that turns venue/provider data into deterministic 
 
 ## Stack Layout
 
+Four Pulumi stacks, each with a distinct lifecycle:
+
 - `infra/core`
-  - persistent storage
+  - persistent storage; rarely touched
   - S3 bucket for raw, normalized, metadata, replay, and canonical artifacts
   - DynamoDB tables for coverage, replay records, and canonical shard records
-- `infra/runtime`
-  - ephemeral compute/networking
-  - ECS, Step Functions, ALB, networking, log groups, secrets, and task definitions
-  - safe to destroy after refresh jobs finish
-- `src/poochon_backtest_data`
-  - ingestion, normalization, canonical build, API, and CLI entrypoints
+- `infra/shared`
+  - shared compute/networking plumbing; ~$0 idle
+  - VPC + subnets + IGW, ECS cluster, CloudWatch log group, ECR repo and Docker image, IAM execution/task roles
+- `infra/write`
+  - ingestion control plane; ~$0 idle (Fargate is pay-per-run)
+  - Sync task definition, Step Functions state machine, IAM role for Step Functions, optional EventBridge scheduler, optional Telonex secret
+- `infra/read`
+  - consumer-facing FastAPI; ~$30/mo when up (ALB + 1 Fargate task)
+  - API task definition, ECS service, ALB + target group + listener, ALB security group
+  - **destroy this stack independently when you don't need the API** — `infra/write` keeps working
+
+Dependency order: `core → shared → (write, read in parallel)`.
+
+`src/poochon_backtest_data/` holds the ingestion, normalization, canonical build, API, and CLI entrypoints. The same CLI binary runs both on your laptop (for local `run`) and inside Fargate (launched by the state machine).
 
 Current dev stack defaults:
 
 - region: `eu-west-1`
 - core stack: persistent
-- runtime stack: ephemeral
+- shared stack: persistent (effectively — kept up because destroy cost = ECR image rebuild)
+- write stack: persistent (~$0 idle)
+- read stack: bring up only when serving consumers
+
+## Separating write and read
+
+The split exists so that turning off the read API doesn't disturb ingestion:
+
+```bash
+# bring up ingestion control plane only
+cd infra/shared && pulumi up --stack dev
+cd infra/write  && pulumi up --stack dev
+
+# ingest stays live; submit jobs via CLI or state machine directly
+poochon-backtest-data submit hyperliquid --instrument BTC --market-type perp \
+  --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
+
+# later — bring up the read side
+cd infra/read && pulumi up --stack dev
+# … use it …
+cd infra/read && pulumi destroy --stack dev  # stops ALB/API billing
+```
 
 ## End-To-End Flow
 
@@ -104,6 +135,46 @@ There are two venue families today:
 ### Raw Stage
 
 Raw objects are provider-native payloads. This stage preserves source fidelity and keeps provider-specific parsing isolated from the normalized schema.
+
+#### Raw Object Keying
+
+Raw keys are composed from the minimum dimensions needed to make each object uniquely addressable and idempotent to re-copy. The dimensions differ per venue because upstream cadence and fan-out differ.
+
+##### Hyperliquid
+
+Hourly-partitioned, scoped to an instrument:
+
+| Family  | Key dimensions                              | Destination key                                                                                                         |
+| ------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| L2 book | `market_type`, `date`, `hour`, `instrument` | `raw/hyperliquid/l2book/market_type=<…>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/<instrument>.lz4`            |
+| Fills   | `market_type`, `date`, `hour`, `instrument` | `raw/hyperliquid/node_fills_by_block/market_type=<…>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/part-<HH>.lz4` |
+
+Notes:
+
+- Sources are requester-pays buckets: `s3://hyperliquid-archive/market_data/YYYYMMDD/<hour>/l2Book/<instrument>.lz4` (L2) and `s3://hl-mainnet-node-data/node_fills_by_block/hourly/YYYYMMDD/<hour>.lz4` (fills).
+- L2 upstream is already instrument-scoped; one upstream object maps to one destination key.
+- Fills upstream is **not** instrument-scoped — it is one `.lz4` per hour covering the whole venue. We still store it under an `instrument=<instrument>` prefix, so the same upstream object is copied once per ingested instrument. Filtering to `coin == <instrument>` happens at normalize time.
+- `market_type` comes from `MarketRef.market_type` (e.g. `perp`).
+- `instrument` is URL-encoded via `MarketRef.encoded_instrument()`.
+- `date` is the UTC calendar day; `hour` is the zero-padded UTC hour.
+
+##### Polymarket
+
+Daily-partitioned, scoped to a single outcome contract:
+
+| Family   | Key dimensions                       | Destination key                                                                                                                     |
+| -------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Book     | `market_id`, `instrument`, `date`    | `raw/telonex/polymarket/channel=book_snapshot_5/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`   |
+| Trades   | `market_id`, `instrument`, `date`    | `raw/telonex/polymarket/channel=trades/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`            |
+| Metadata | `market_id`, `instrument`            | `metadata/polymarket/market_id=<market_id>/instrument=<instrument>/manifest.json`                                                   |
+
+Notes:
+
+- Source: Telonex REST `GET /<channel>/<date>?market_id=<market_id>&outcome=<outcome>`, Bearer-authed with `POOCHON_TELONEX_API_KEY`.
+- Partitioning is daily because Telonex returns one parquet per `(market_id, outcome, date)`.
+- `market_id` is the on-chain hex address; `instrument` is `<slug>:<outcome>` (e.g. `btc-updown-5m-1771459200:Up`). Both are URL-encoded.
+- Both `market_id` and `instrument` appear in the key even though the former implies the latter — listings stay scoped either way, and raw/normalized key shapes stay symmetric.
+- A 404 from Telonex is written as an **empty parquet** at the canonical key so downstream stages always see a uniform input shape.
 
 #### Hyperliquid Raw
 
@@ -343,100 +414,115 @@ That is why normalized rows carry `source_hour` and `source_line_number`.
 
 ## CLI And Operational Flow
 
-The local CLI is enough to operate against the AWS-backed storage layer. Runtime infrastructure is only needed when you want the managed ECS/Step Functions execution path.
+The CLI is an operator console for the pipeline — it executes stages locally, submits jobs to AWS, inspects what data exists, and reports stack status. Everything talks directly to S3 / DynamoDB / Step Functions; no local server required.
 
-Required environment for local AWS-backed runs:
+Required environment:
 
 ```bash
 export POOCHON_AWS_REGION=eu-west-1
 export POOCHON_DATA_BUCKET=poochon-backtest-data-778822980471-eu-west-1-dev
 export POOCHON_COVERAGE_TABLE_NAME=poochon-backtest-data-coverage-dev
-export POOCHON_REPLAY_TABLE_NAME=poochon-backtest-data-replays-dev
 export POOCHON_SHARD_TABLE_NAME=poochon-backtest-data-replay-shards-dev
-export POOCHON_TELONEX_API_KEY=...
+export POOCHON_TELONEX_API_KEY=...  # only for polymarket
 ```
 
-### Refresh Polymarket Data And Canonical Replay
+### Command tree
+
+```
+poochon-backtest-data
+├── api                             # serve FastAPI (consumer read API)
+├── infra
+│   └── status                      # UP/DOWN per Pulumi stack + key outputs
+├── data
+│   ├── inventory                   # expected/ready/failed/missing per stage
+│   └── coverage                    # dump DDB coverage rows by pk prefix
+├── run                             # execute a stage LOCALLY (blocks)
+│   ├── hyperliquid {raw|normalize|canonical|all}
+│   └── polymarket  {discover|raw|normalize|canonical|all}
+├── submit                          # start a Step Functions execution on AWS
+│   ├── hyperliquid
+│   └── polymarket
+└── job                             # track AWS executions
+    ├── list
+    ├── status <execution-arn>
+    └── logs <execution-arn> [--follow]
+```
+
+The legacy flat commands (`hyperliquid-sync-window`, `polymarket-sync-series`, etc.) still work as deprecated aliases so existing Step Functions state machines keep running during the transition.
+
+### Canonical walkthrough
 
 ```bash
-uv run poochon-backtest-data polymarket-sync-series \
+# 1. Where are we?
+poochon-backtest-data infra status
+
+# 2. Run a single stage locally — idempotent, so re-running is a no-op.
+poochon-backtest-data run hyperliquid raw \
+  --market-type perp --instrument BTC \
+  --start-date 2026-02-19 --end-date 2026-02-19
+
+# 3. Check what landed.
+poochon-backtest-data data inventory \
+  --venue hyperliquid --market-type perp --instrument BTC \
+  --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
+
+# 4. Full stream, same window.
+poochon-backtest-data run hyperliquid all \
+  --market-type perp --instrument BTC \
+  --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
+
+# 5. Same thing on AWS instead of your laptop.
+poochon-backtest-data submit hyperliquid \
+  --market-type perp --instrument BTC \
+  --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
+# → prints execution ARN
+
+# 6. Track it.
+poochon-backtest-data job status <execution-arn>
+poochon-backtest-data job logs <execution-arn> --follow
+```
+
+### Refreshing Polymarket
+
+```bash
+poochon-backtest-data run polymarket all \
   --series btc-updown-5m \
-  --start-date 2026-02-19 \
-  --end-date 2026-02-21 \
-  --outcomes both \
-  --depth 5
+  --start-date 2026-02-19 --end-date 2026-02-21 \
+  --outcomes both --depth 5
 ```
 
-This command:
+This discovers contracts, writes metadata manifests, downloads missing raw Telonex parquet, normalizes per-market parquet, and force-rebuilds the canonical daily shards. Every sub-stage is individually callable (`run polymarket discover`, `run polymarket raw`, etc.) if you want to isolate a step.
 
-- discovers the Polymarket contracts for the window
-- overwrites metadata manifests for discovered outcomes
-- downloads any missing raw Telonex parquet
-- normalizes any missing per-market parquet
-- force-rebuilds the canonical daily shards for the requested dates
+### Stack Lifecycle
 
-If normalized inputs already exist and only canonical output is stale, rebuild only the canonical stage:
+Bring the ingestion path up (one-time):
 
 ```bash
-uv run poochon-backtest-data polymarket-build-canonical-window \
-  --series btc-updown-5m \
-  --start-date 2026-02-19 \
-  --end-date 2026-02-21 \
-  --outcomes both \
-  --depth 5 \
-  --force
+cd infra/shared && pulumi up --stack dev
+cd infra/write  && pulumi up --stack dev
 ```
 
-### Refresh Hyperliquid Data
+Bring the read API up (only when needed):
 
 ```bash
-uv run poochon-backtest-data hyperliquid-sync-window \
-  --market-type perp \
-  --instrument BTC \
-  --start-date 2026-02-19 \
-  --end-date 2026-02-21 \
-  --depth 20
+cd infra/read && pulumi up --stack dev
 ```
 
-If normalized Hyperliquid inputs already exist and only canonical output is stale, rebuild only the canonical stage:
+Take the read API down without touching ingestion:
 
 ```bash
-uv run poochon-backtest-data hyperliquid-build-canonical-window \
-  --market-type perp \
-  --instrument BTC \
-  --start-date 2026-02-19 \
-  --end-date 2026-02-21 \
-  --depth 20 \
-  --force
+cd infra/read && pulumi destroy --yes --stack dev
 ```
 
-### Runtime Stack Lifecycle
-
-Bring runtime up only when you want the AWS-managed execution path:
+Full teardown of the ephemeral side (keeps `infra/core` data):
 
 ```bash
-cd infra/runtime
-PULUMI_PYTHON_CMD=./.venv/bin/python pulumi up --stack dev
+cd infra/read   && pulumi destroy --yes --stack dev
+cd infra/write  && pulumi destroy --yes --stack dev
+cd infra/shared && pulumi destroy --yes --stack dev
 ```
 
-Destroy runtime when work is done:
-
-```bash
-cd infra/runtime
-PULUMI_PYTHON_CMD=./.venv/bin/python pulumi destroy --yes --stack dev
-```
-
-Destroying `infra/runtime` should remove ephemeral AWS resources only:
-
-- VPC / subnets / route tables / security groups
-- ECS cluster / task definitions / services
-- ALB / target groups / listeners
-- ECR repo
-- runtime log groups
-- runtime secrets
-- Step Functions and schedules
-
-It must not remove `infra/core` storage:
+Destroying any of `shared`, `write`, or `read` must not touch `infra/core`:
 
 - S3 bucket
 - coverage table

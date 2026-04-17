@@ -1,0 +1,4 @@
+name: poochon-backtest-data-write
+runtime:
+  name: python
+description: Ingestion control plane — sync task definition, Step Functions state machine, and scheduler.

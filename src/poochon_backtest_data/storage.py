@@ -11,9 +11,22 @@ from botocore.exceptions import ClientError
 import orjson
 import zstandard
 
-from .models import CanonicalShardRecord, CoverageRecord, ReplayRecord
+from .models import (
+    CanonicalShardRecord,
+    CoverageRecord,
+    DatasetKind,
+    MarketRef,
+    OutcomesMode,
+    Venue,
+    canonical_hyperliquid_shard_id,
+    canonical_polymarket_shard_id,
+    coverage_pk,
+    iter_dates_inclusive,
+)
+from .models import ReplayRecord
 
 S3_CLIENT_CONFIG = Config(max_pool_connections=64)
+DYNAMODB_BATCH_GET_LIMIT = 100
 
 
 def boto3_session(region: str):
@@ -73,6 +86,12 @@ class S3Store:
                 return None
             raise
 
+    def list_prefix(self, prefix: str) -> Iterator[str]:
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                yield obj["Key"]
+
     def stream_zstd(self, key: str, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
         response = self.client.get_object(Bucket=self.bucket, Key=key)
         body = response["Body"]
@@ -106,6 +125,45 @@ class CoverageRepository:
 
     def put(self, record: CoverageRecord) -> None:
         self.table.put_item(Item=record.model_dump(mode="json"))
+
+    def batch_get(self, pks: list[str]) -> dict[str, CoverageRecord | None]:
+        result: dict[str, CoverageRecord | None] = {pk: None for pk in pks}
+        if not pks:
+            return result
+        client = self.table.meta.client
+        unique = list(dict.fromkeys(pks))
+        for start in range(0, len(unique), DYNAMODB_BATCH_GET_LIMIT):
+            chunk = unique[start : start + DYNAMODB_BATCH_GET_LIMIT]
+            request = {self.table_name: {"Keys": [{"pk": pk} for pk in chunk]}}
+            while request:
+                response = client.batch_get_item(RequestItems=request)
+                for item in response.get("Responses", {}).get(self.table_name, []):
+                    record = CoverageRecord.model_validate(item)
+                    result[record.pk] = record
+                request = response.get("UnprocessedKeys") or {}
+        return result
+
+    def list_window(
+        self,
+        *,
+        dataset_kind: DatasetKind,
+        market: MarketRef,
+        start_date: str,
+        end_date: str,
+        hours: list[str],
+    ) -> dict[tuple[str, str], CoverageRecord | None]:
+        """Return per-(date, hour) coverage records for a window.
+
+        Keys are (date, hour) tuples. Missing cells map to None.
+        """
+        dates = iter_dates_inclusive(start_date, end_date)
+        pk_to_cell: dict[str, tuple[str, str]] = {}
+        for date in dates:
+            for hour in hours:
+                pk = coverage_pk(dataset_kind, market, date, hour)
+                pk_to_cell[pk] = (date, hour)
+        records = self.batch_get(list(pk_to_cell))
+        return {cell: records[pk] for pk, cell in pk_to_cell.items()}
 
 
 class ReplayRepository:
@@ -156,3 +214,53 @@ class CanonicalShardRepository:
 
     def put(self, record: CanonicalShardRecord) -> None:
         self.table.put_item(Item=record.model_dump(mode="json"))
+
+    def batch_get(self, shard_ids: list[str]) -> dict[str, CanonicalShardRecord | None]:
+        result: dict[str, CanonicalShardRecord | None] = {sid: None for sid in shard_ids}
+        if not shard_ids:
+            return result
+        client = self.table.meta.client
+        unique = list(dict.fromkeys(shard_ids))
+        for start in range(0, len(unique), DYNAMODB_BATCH_GET_LIMIT):
+            chunk = unique[start : start + DYNAMODB_BATCH_GET_LIMIT]
+            request = {self.table_name: {"Keys": [{"shard_id": sid} for sid in chunk]}}
+            while request:
+                response = client.batch_get_item(RequestItems=request)
+                for item in response.get("Responses", {}).get(self.table_name, []):
+                    record = CanonicalShardRecord.model_validate(item)
+                    result[record.shard_id] = record
+                request = response.get("UnprocessedKeys") or {}
+        return result
+
+    def list_hyperliquid_window(
+        self,
+        *,
+        market: MarketRef,
+        start_date: str,
+        end_date: str,
+        depth: int,
+    ) -> dict[str, CanonicalShardRecord | None]:
+        shard_ids = {
+            date: canonical_hyperliquid_shard_id(market, date, depth)
+            for date in iter_dates_inclusive(start_date, end_date)
+        }
+        records = self.batch_get(list(shard_ids.values()))
+        return {date: records[sid] for date, sid in shard_ids.items()}
+
+    def list_polymarket_window(
+        self,
+        *,
+        series_key: str,
+        outcomes: OutcomesMode,
+        start_date: str,
+        end_date: str,
+        depth: int,
+    ) -> dict[str, CanonicalShardRecord | None]:
+        shard_ids = {
+            date: canonical_polymarket_shard_id(
+                series_key=series_key, date=date, outcomes=outcomes, depth=depth
+            )
+            for date in iter_dates_inclusive(start_date, end_date)
+        }
+        records = self.batch_get(list(shard_ids.values()))
+        return {date: records[sid] for date, sid in shard_ids.items()}
