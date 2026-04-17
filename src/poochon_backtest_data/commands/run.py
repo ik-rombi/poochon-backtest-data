@@ -245,33 +245,62 @@ def _handle_polymarket(args: Namespace) -> int:
     resolutions = _discovered_resolutions(args)
     telonex_api_key = require_telonex_api_key() if args.stage == "raw" else None
 
-    for resolution in resolutions:
-        if args.stage == "raw":
-            logger.info(
-                "polymarket raw series=%s market_id=%s outcome=%s",
-                args.series,
-                resolution.market_id,
-                resolution.outcome,
-            )
-            backfill_market(
-                bundle.s3_store,
-                bundle.coverage_repo,
-                resolution=resolution,
-                telonex_api_key=telonex_api_key,
-            )
-        elif args.stage == "normalize":
-            logger.info(
-                "polymarket normalize series=%s market_id=%s outcome=%s",
-                args.series,
-                resolution.market_id,
-                resolution.outcome,
-            )
-            normalize_market(
-                bundle.s3_store,
-                bundle.coverage_repo,
-                resolution=resolution,
-            )
-        else:
-            raise RuntimeError(f"unsupported stage: {args.stage}")
+    if args.stage not in {"raw", "normalize"}:
+        raise RuntimeError(f"unsupported stage: {args.stage}")
 
+    # Mirror sync_series: per-thread clones of S3 + coverage to avoid
+    # boto3 client sharing across threads.
+    from threading import local as _local
+    worker_state = _local()
+
+    def process(resolution):
+        if not hasattr(worker_state, "store"):
+            worker_state.store = bundle.s3_store.clone() if hasattr(bundle.s3_store, "clone") else bundle.s3_store
+            worker_state.coverage = bundle.coverage_repo.clone() if hasattr(bundle.coverage_repo, "clone") else bundle.coverage_repo
+        try:
+            if args.stage == "raw":
+                logger.info(
+                    "polymarket raw series=%s market_id=%s outcome=%s",
+                    args.series, resolution.market_id, resolution.outcome,
+                )
+                backfill_market(
+                    worker_state.store,
+                    worker_state.coverage,
+                    resolution=resolution,
+                    telonex_api_key=telonex_api_key,
+                )
+            else:
+                logger.info(
+                    "polymarket normalize series=%s market_id=%s outcome=%s",
+                    args.series, resolution.market_id, resolution.outcome,
+                )
+                normalize_market(
+                    worker_state.store,
+                    worker_state.coverage,
+                    resolution=resolution,
+                )
+            return None
+        except Exception as error:
+            return {
+                "market_id": resolution.market_id,
+                "outcome": resolution.outcome,
+                "error": f"{type(error).__name__}: {error}",
+            }
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+    max_workers = min(8, len(resolutions)) or 1
+    failures: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process, r) for r in resolutions]
+        for future in _as_completed(futures):
+            result = future.result()
+            if result is not None:
+                failures.append(result)
+
+    if failures:
+        logger.warning(
+            "polymarket %s stage finished with %d failures (of %d); first: %s",
+            args.stage, len(failures), len(resolutions), failures[0],
+        )
     return 0

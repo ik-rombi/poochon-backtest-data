@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date as date_cls, datetime, time as time_cls, timedelta
 import io
+import logging
 from pathlib import Path
+import time
 from threading import local
 from typing import Any
 
@@ -12,6 +14,12 @@ import httpx
 import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+logger = logging.getLogger(__name__)
+
+TELONEX_MAX_RETRIES = 3
+TELONEX_RETRYABLE_STATUS = {500, 502, 503, 504}
+TELONEX_BACKOFF_BASE_SECONDS = 2.0
 
 from .canonical import build_polymarket_canonical_day, build_polymarket_canonical_day_from_storage
 from .models import (
@@ -158,22 +166,25 @@ def _window_bounds_from_slug(slug: str) -> tuple[int, int] | None:
 
 
 def _contract_window_from_payload(payload: dict[str, Any]) -> tuple[datetime, datetime, int, int]:
+    # Prefer the slug-derived window — it's the authoritative source for 5m
+    # series contracts and doesn't depend on Gamma's startDate/endDate fields,
+    # which are sometimes missing on newer payloads.
+    window = _window_bounds_from_slug(str(payload["slug"]))
+    if window is not None:
+        start_ts_ms, end_ts_ms = window
+        return (
+            datetime.fromtimestamp(start_ts_ms / 1000, tz=UTC),
+            datetime.fromtimestamp(end_ts_ms / 1000, tz=UTC),
+            start_ts_ms,
+            end_ts_ms,
+        )
     fallback_start = _parse_utc_timestamp(payload["startDate"])
     fallback_end = _parse_utc_timestamp(payload["endDate"])
-    window = _window_bounds_from_slug(str(payload["slug"]))
-    if window is None:
-        return (
-            fallback_start,
-            fallback_end,
-            int(fallback_start.timestamp() * 1000),
-            int(fallback_end.timestamp() * 1000),
-        )
-    start_ts_ms, end_ts_ms = window
     return (
-        datetime.fromtimestamp(start_ts_ms / 1000, tz=UTC),
-        datetime.fromtimestamp(end_ts_ms / 1000, tz=UTC),
-        start_ts_ms,
-        end_ts_ms,
+        fallback_start,
+        fallback_end,
+        int(fallback_start.timestamp() * 1000),
+        int(fallback_end.timestamp() * 1000),
     )
 
 
@@ -457,19 +468,51 @@ def _download_channel(
     own_client = client is None
     http = _client(client)
     try:
-        response = http.get(
-            f"{TELONEX_DOWNLOAD_BASE_URL}/{channel}/{date}",
-            params={"market_id": market_id, "outcome": outcome},
-            headers={"Authorization": f"Bearer {telonex_api_key}"},
+        last_error_detail = ""
+        for attempt in range(TELONEX_MAX_RETRIES):
+            try:
+                response = http.get(
+                    f"{TELONEX_DOWNLOAD_BASE_URL}/{channel}/{date}",
+                    params={"market_id": market_id, "outcome": outcome},
+                    headers={"Authorization": f"Bearer {telonex_api_key}"},
+                )
+            except (httpx.RequestError, httpx.TimeoutException) as error:
+                last_error_detail = f"{type(error).__name__}: {error}"
+                if attempt + 1 < TELONEX_MAX_RETRIES:
+                    wait = TELONEX_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                    logger.warning(
+                        "telonex %s network error (attempt %d/%d), retrying in %.1fs: %s",
+                        channel, attempt + 1, TELONEX_MAX_RETRIES, wait, error,
+                    )
+                    time.sleep(wait)
+                    continue
+                break
+
+            if response.status_code == 404:
+                return _empty_channel_payload(channel), True
+            if response.status_code in TELONEX_RETRYABLE_STATUS:
+                last_error_detail = f"HTTP {response.status_code}: {response.text.strip()[:200]}"
+                if attempt + 1 < TELONEX_MAX_RETRIES:
+                    wait = TELONEX_BACKOFF_BASE_SECONDS * (2 ** attempt)
+                    logger.warning(
+                        "telonex %s %d for market_id=%s outcome=%s date=%s (attempt %d/%d), retrying in %.1fs",
+                        channel, response.status_code, market_id, outcome, date,
+                        attempt + 1, TELONEX_MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                break
+            if response.status_code >= 400:
+                detail = response.text.strip()
+                raise ValueError(
+                    f"Telonex {channel} request failed for market_id={market_id} outcome={outcome} date={date}: {detail}"
+                )
+            return response.content, False
+
+        raise ValueError(
+            f"Telonex {channel} exhausted {TELONEX_MAX_RETRIES} retries for "
+            f"market_id={market_id} outcome={outcome} date={date}: {last_error_detail}"
         )
-        if response.status_code == 404:
-            return _empty_channel_payload(channel), True
-        if response.status_code >= 400:
-            detail = response.text.strip()
-            raise ValueError(
-                f"Telonex {channel} request failed for market_id={market_id} outcome={outcome} date={date}: {detail}"
-            )
-        return response.content, False
     finally:
         if own_client:
             http.close()
@@ -744,45 +787,82 @@ def _iter_series_candidate_slugs(series_key: str, start_date: str, end_date: str
     return slugs
 
 
+DISCOVER_MAX_WORKERS = 16
+
+
 def discover_series_markets(
     request: PolymarketSeriesSyncRequest,
     *,
     client: httpx.Client | None = None,
 ) -> list[PolymarketMarketResolution]:
-    own_client = client is None
-    http = _client(client)
-    try:
-        window_start = datetime.combine(
-            date_cls.fromisoformat(request.start_date),
-            time_cls.min,
-            tzinfo=UTC,
-        )
-        window_end = datetime.combine(
-            date_cls.fromisoformat(request.end_date),
-            time_cls.max,
-            tzinfo=UTC,
-        )
-        results: list[PolymarketMarketResolution] = []
-        seen: set[tuple[str, str]] = set()
-        for slug in _iter_series_candidate_slugs(request.series, request.start_date, request.end_date):
+    window_start = datetime.combine(
+        date_cls.fromisoformat(request.start_date),
+        time_cls.min,
+        tzinfo=UTC,
+    )
+    window_end = datetime.combine(
+        date_cls.fromisoformat(request.end_date),
+        time_cls.max,
+        tzinfo=UTC,
+    )
+    slugs = _iter_series_candidate_slugs(
+        request.series, request.start_date, request.end_date
+    )
+
+    worker_state = local()
+
+    def worker_client() -> httpx.Client:
+        if not hasattr(worker_state, "client"):
+            worker_state.client = client if client is not None else httpx.Client(timeout=30.0)
+        return worker_state.client
+
+    failures: list[dict[str, Any]] = []
+    failures_lock = local()  # appends from threads; Python list.append is GIL-safe
+
+    def process_slug(slug: str) -> list[PolymarketMarketResolution]:
+        http = worker_client()
+        try:
             response = http.get(f"{GAMMA_BASE_URL}/markets/slug/{slug}")
             if response.status_code == 404:
-                continue
+                return []
             response.raise_for_status()
             payload = response.json()
+        except Exception as error:
+            failures.append({
+                "slug": slug,
+                "phase": "gamma-fetch",
+                "error": f"{type(error).__name__}: {error}",
+            })
+            return []
+
+        try:
             start, end, start_ts_ms, end_ts_ms = _contract_window_from_payload(payload)
-            if end < window_start or start > window_end:
-                continue
-            price_to_beat = _fetch_price_to_beat(
-                http,
-                slug=str(payload["slug"]),
-                start_ts_ms=start_ts_ms,
-            )
-            settlement_price = _fetch_price_to_beat(
-                http,
-                slug=str(payload["slug"]),
-                start_ts_ms=end_ts_ms,
-            )
+        except Exception as error:
+            failures.append({
+                "slug": slug,
+                "phase": "parse-window",
+                "error": f"{type(error).__name__}: {error}",
+                "payload_keys": sorted(payload.keys()) if isinstance(payload, dict) else None,
+                "payload_sample": {k: payload.get(k) for k in ("slug", "startDate", "endDate", "startDateIso", "endDateIso", "gameStartTime")} if isinstance(payload, dict) else None,
+            })
+            return []
+
+        if end < window_start or start > window_end:
+            return []
+
+        try:
+            price_to_beat = _fetch_price_to_beat(http, slug=str(payload["slug"]), start_ts_ms=start_ts_ms)
+            settlement_price = _fetch_price_to_beat(http, slug=str(payload["slug"]), start_ts_ms=end_ts_ms)
+        except Exception as error:
+            failures.append({
+                "slug": slug,
+                "phase": "price-to-beat",
+                "error": f"{type(error).__name__}: {error}",
+            })
+            return []
+
+        out: list[PolymarketMarketResolution] = []
+        try:
             for outcome in ("Up", "Down"):
                 resolution = _resolution_from_payload(
                     payload,
@@ -795,15 +875,50 @@ def discover_series_markets(
                         settlement_price=settlement_price,
                     ),
                 )
+                out.append(resolution)
+        except Exception as error:
+            failures.append({
+                "slug": slug,
+                "phase": "build-resolution",
+                "error": f"{type(error).__name__}: {error}",
+            })
+            return []
+        return out
+
+    logger.info(
+        "discover_series_markets: probing %d candidate slugs for series=%s (workers=%d)",
+        len(slugs), request.series, DISCOVER_MAX_WORKERS,
+    )
+
+    results: list[PolymarketMarketResolution] = []
+    seen: set[tuple[str, str]] = set()
+    completed = 0
+    with ThreadPoolExecutor(max_workers=DISCOVER_MAX_WORKERS) as executor:
+        future_to_slug = {executor.submit(process_slug, slug): slug for slug in slugs}
+        for future in as_completed(future_to_slug):
+            completed += 1
+            if completed % 500 == 0:
+                logger.info(
+                    "discover_series_markets: %d/%d probed, %d resolutions so far, %d failures",
+                    completed, len(slugs), len(results), len(failures),
+                )
+            for resolution in future.result():
                 key = (resolution.slug, resolution.outcome)
                 if key in seen:
                     continue
                 seen.add(key)
                 results.append(resolution)
-        return sorted(results, key=lambda item: (item.slug, item.outcome))
-    finally:
-        if own_client:
-            http.close()
+
+    if failures:
+        logger.warning(
+            "discover_series_markets finished with %d failures; sample: %s",
+            len(failures), failures[:5],
+        )
+    logger.info(
+        "discover_series_markets: series=%s resolved=%d failed=%d",
+        request.series, len(results), len(failures),
+    )
+    return sorted(results, key=lambda item: (item.slug, item.outcome))
 
 
 def _clip_resolution_to_window(

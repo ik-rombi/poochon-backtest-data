@@ -52,15 +52,30 @@ def requester_pays_copy(
     source_key: str,
     destination_key: str,
     request_payer: str = "requester",
-) -> int:
+) -> int | None:
+    """Copy an object from a requester-pays bucket into our data bucket.
+
+    Returns the byte count written, or None if the upstream object does
+    not exist yet (so the caller can skip this hour instead of dying
+    mid-window). Upstream archives often lag by days/hours — treating a
+    missing key as "not yet available" matches Polymarket's Telonex path,
+    which uses empty-parquet sentinels for 404s.
+    """
     existing_size = destination.object_size(destination_key)
     if existing_size is not None:
         return existing_size
-    response = destination.client.get_object(
-        Bucket=source_bucket,
-        Key=source_key,
-        RequestPayer=request_payer,
-    )
+    try:
+        response = destination.client.get_object(
+            Bucket=source_bucket,
+            Key=source_key,
+            RequestPayer=request_payer,
+        )
+    except destination.client.exceptions.NoSuchKey:
+        return None
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+            return None
+        raise
     payload = response["Body"].read()
     destination.put_bytes(destination_key, payload, content_type="application/octet-stream")
     return len(payload)
@@ -217,6 +232,7 @@ def _put_coverage(
     byte_count: int,
     row_count: int,
     source: str,
+    status: CoverageStatus = CoverageStatus.READY,
 ) -> CoverageRecord:
     record = CoverageRecord(
         pk=coverage_pk(dataset_kind, market, date, hour),
@@ -226,7 +242,7 @@ def _put_coverage(
         instrument=market.instrument,
         date=date,
         hour=hour,
-        status=CoverageStatus.READY,
+        status=status,
         object_count=object_count,
         byte_count=byte_count,
         row_count=row_count,
@@ -256,6 +272,8 @@ def backfill_day(
 
     l2_bytes = 0
     trade_bytes = 0
+    l2_hours_ok = 0
+    trade_hours_ok = 0
     for hour in range(24):
         l2_hour = _coverage_ready(coverage, DatasetKind.RAW_L2, market, date, f"{hour:02d}")
         trade_hour = _coverage_ready(coverage, DatasetKind.RAW_TRADES, market, date, f"{hour:02d}")
@@ -272,17 +290,18 @@ def backfill_day(
                 destination_key=l2_key,
                 request_payer=request_payer,
             )
-            _put_coverage(
-                coverage,
-                dataset_kind=DatasetKind.RAW_L2,
-                market=market,
-                date=date,
-                hour=f"{hour:02d}",
-                object_count=1,
-                byte_count=copied_l2,
-                row_count=0,
-                source=f"s3://{L2_SOURCE_BUCKET}/{l2_source_key(market, date, hour)}",
-            )
+            if copied_l2 is not None:
+                _put_coverage(
+                    coverage,
+                    dataset_kind=DatasetKind.RAW_L2,
+                    market=market,
+                    date=date,
+                    hour=f"{hour:02d}",
+                    object_count=1,
+                    byte_count=copied_l2,
+                    row_count=0,
+                    source=f"s3://{L2_SOURCE_BUCKET}/{l2_source_key(market, date, hour)}",
+                )
 
         if trade_hour and destination.exists(trade_key):
             copied_trades = trade_hour.byte_count
@@ -294,31 +313,42 @@ def backfill_day(
                 destination_key=trade_key,
                 request_payer=request_payer,
             )
-            _put_coverage(
-                coverage,
-                dataset_kind=DatasetKind.RAW_TRADES,
-                market=market,
-                date=date,
-                hour=f"{hour:02d}",
-                object_count=1,
-                byte_count=copied_trades,
-                row_count=0,
-                source=f"s3://{TRADE_SOURCE_BUCKET}/{trade_source_key(date, hour)}",
-            )
+            if copied_trades is not None:
+                _put_coverage(
+                    coverage,
+                    dataset_kind=DatasetKind.RAW_TRADES,
+                    market=market,
+                    date=date,
+                    hour=f"{hour:02d}",
+                    object_count=1,
+                    byte_count=copied_trades,
+                    row_count=0,
+                    source=f"s3://{TRADE_SOURCE_BUCKET}/{trade_source_key(date, hour)}",
+                )
 
-        l2_bytes += copied_l2
-        trade_bytes += copied_trades
+        if copied_l2 is not None:
+            l2_hours_ok += 1
+        if copied_trades is not None:
+            trade_hours_ok += 1
+        l2_bytes += copied_l2 or 0
+        trade_bytes += copied_trades or 0
 
+    # Daily rollup must reflect reality: object_count = hours that actually
+    # landed, status = READY only when the full 24h is present. Partial days
+    # (upstream lag, transient 404s) are marked FAILED so downstream stages
+    # and `data inventory` can tell apart "complete day" from "we tried but
+    # upstream had nothing yet."
     _put_coverage(
         coverage,
         dataset_kind=DatasetKind.RAW_L2,
         market=market,
         date=date,
         hour="daily",
-        object_count=24,
+        object_count=l2_hours_ok,
         byte_count=l2_bytes,
         row_count=0,
         source=L2_SOURCE_BUCKET,
+        status=CoverageStatus.READY if l2_hours_ok == 24 else CoverageStatus.FAILED,
     )
     _put_coverage(
         coverage,
@@ -326,10 +356,11 @@ def backfill_day(
         market=market,
         date=date,
         hour="daily",
-        object_count=24,
+        object_count=trade_hours_ok,
         byte_count=trade_bytes,
         row_count=0,
         source=TRADE_SOURCE_BUCKET,
+        status=CoverageStatus.READY if trade_hours_ok == 24 else CoverageStatus.FAILED,
     )
 
 
