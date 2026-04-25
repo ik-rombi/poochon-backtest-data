@@ -12,6 +12,7 @@ stack = pulumi.get_stack()
 config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
 core_stack_ref = config.require("coreStackRef")
+expected_aws_account_id = config.require("expectedAwsAccountId")
 
 core = pulumi.StackReference(core_stack_ref)
 bucket_name = core.require_output("data_bucket_name")
@@ -21,6 +22,18 @@ replay_shard_table_name = core.require_output("replay_shard_table_name")
 region = aws.get_region_output()
 caller = aws.get_caller_identity_output()
 availability_zones = aws.get_availability_zones(state="available")
+
+
+def require_expected_account(account_id: str) -> str:
+    if account_id != expected_aws_account_id:
+        raise ValueError(
+            f"refusing to deploy to AWS account {account_id}; "
+            f"expected {expected_aws_account_id}"
+        )
+    return account_id
+
+
+aws_account_id = caller.account_id.apply(require_expected_account)
 
 
 def assume_role_policy(service: str) -> str:
@@ -174,7 +187,7 @@ aws.iam.RolePolicy(
         coverage_table_name,
         replay_shard_table_name,
         region.name,
-        caller.account_id,
+        aws_account_id,
     ).apply(
         lambda args: json.dumps(
             {
@@ -240,3 +253,4 @@ pulumi.export("execution_role_arn", execution_role.arn)
 pulumi.export("execution_role_name", execution_role.name)
 pulumi.export("execution_role_id", execution_role.id)
 pulumi.export("task_role_arn", task_role.arn)
+pulumi.export("aws_account_id", aws_account_id)

@@ -11,6 +11,21 @@ config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
 core_stack_ref = config.require("coreStackRef")
 shared_stack_ref = config.require("sharedStackRef")
+expected_aws_account_id = config.require("expectedAwsAccountId")
+
+caller = aws.get_caller_identity_output()
+
+
+def require_expected_account(account_id: str) -> str:
+    if account_id != expected_aws_account_id:
+        raise ValueError(
+            f"refusing to deploy to AWS account {account_id}; "
+            f"expected {expected_aws_account_id}"
+        )
+    return account_id
+
+
+aws_account_id = caller.account_id.apply(require_expected_account)
 
 core = pulumi.StackReference(core_stack_ref)
 shared = pulumi.StackReference(shared_stack_ref)
@@ -191,3 +206,4 @@ pulumi.export("api_url", alb.dns_name.apply(lambda dns: f"http://{dns}"))
 pulumi.export("api_service_name", api_service.name)
 pulumi.export("api_task_definition_arn", api_task_definition.arn)
 pulumi.export("alb_arn", alb.arn)
+pulumi.export("aws_account_id", aws_account_id)

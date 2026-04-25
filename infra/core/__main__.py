@@ -7,11 +7,23 @@ import pulumi_aws as aws
 stack = pulumi.get_stack()
 config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
+expected_aws_account_id = config.require("expectedAwsAccountId")
 
 caller = aws.get_caller_identity_output()
 region = aws.get_region_output()
 
-bucket_name = pulumi.Output.all(caller.account_id, region.name).apply(
+def require_expected_account(account_id: str) -> str:
+    if account_id != expected_aws_account_id:
+        raise ValueError(
+            f"refusing to deploy to AWS account {account_id}; "
+            f"expected {expected_aws_account_id}"
+        )
+    return account_id
+
+
+aws_account_id = caller.account_id.apply(require_expected_account)
+
+bucket_name = pulumi.Output.all(aws_account_id, region.name).apply(
     lambda args: f"{prefix}-{args[0]}-{args[1]}-{stack}"
 )
 
@@ -62,3 +74,4 @@ pulumi.export("data_bucket_name", data_bucket.bucket)
 pulumi.export("coverage_table_name", coverage_table.name)
 pulumi.export("replay_table_name", replay_table.name)
 pulumi.export("replay_shard_table_name", replay_shard_table.name)
+pulumi.export("aws_account_id", aws_account_id)

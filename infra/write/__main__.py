@@ -11,6 +11,21 @@ config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
 core_stack_ref = config.require("coreStackRef")
 shared_stack_ref = config.require("sharedStackRef")
+expected_aws_account_id = config.require("expectedAwsAccountId")
+
+caller = aws.get_caller_identity_output()
+
+
+def require_expected_account(account_id: str) -> str:
+    if account_id != expected_aws_account_id:
+        raise ValueError(
+            f"refusing to deploy to AWS account {account_id}; "
+            f"expected {expected_aws_account_id}"
+        )
+    return account_id
+
+
+aws_account_id = caller.account_id.apply(require_expected_account)
 
 ingestion_mode = (config.get("ingestionMode") or "disabled").lower()
 ingestion_venue = (config.get("ingestionVenue") or "hyperliquid").lower()
@@ -470,5 +485,6 @@ pulumi.export(
     "ingestion_schedule_name",
     ingestion_schedule.name if ingestion_schedule is not None else pulumi.Output.from_input(""),
 )
+pulumi.export("aws_account_id", aws_account_id)
 if telonex_secret is not None:
     pulumi.export("telonex_secret_arn", telonex_secret.arn)
