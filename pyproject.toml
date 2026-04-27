@@ -17,6 +17,7 @@ dependencies = [
     "python-dateutil>=2.9",
     "uvicorn[standard]>=0.34",
     "zstandard>=0.23",
+    "duckdb>=1.5.2",
 ]
 
 [dependency-groups]

@@ -17,7 +17,7 @@ expected_aws_account_id = config.require("expectedAwsAccountId")
 core = pulumi.StackReference(core_stack_ref)
 bucket_name = core.require_output("data_bucket_name")
 coverage_table_name = core.require_output("coverage_table_name")
-replay_shard_table_name = core.require_output("replay_shard_table_name")
+shard_table_name = core.require_output("shard_table_name")
 
 region = aws.get_region_output()
 caller = aws.get_caller_identity_output()
@@ -185,7 +185,7 @@ aws.iam.RolePolicy(
         bucket_arn,
         bucket_objects_arn,
         coverage_table_name,
-        replay_shard_table_name,
+        shard_table_name,
         region.name,
         aws_account_id,
     ).apply(

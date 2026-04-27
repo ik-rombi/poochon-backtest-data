@@ -13,20 +13,16 @@ class CommandModule(Protocol):
 
 
 def build_parser() -> ArgumentParser:
-    from . import api, data, infra, job, legacy, run, submit
+    from . import data, infra, job, run, schedule, submit
 
     parser = ArgumentParser(prog="poochon-backtest-data")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    primary_modules = [api, infra, data, run, submit, job]
+    modules = [infra, data, run, submit, schedule, job]
     dispatch_table: dict[str, CommandModule] = {}
-    for module in primary_modules:
+    for module in modules:
         module.register(subparsers)
         dispatch_table[module.name] = module
-
-    legacy.register(subparsers)
-    for command_name in legacy.legacy_command_names():
-        dispatch_table[command_name] = legacy
 
     parser.set_defaults(_modules=dispatch_table)
     return parser

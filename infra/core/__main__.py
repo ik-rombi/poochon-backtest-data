@@ -52,16 +52,10 @@ coverage_table = aws.dynamodb.Table(
     tags={"Project": "poochon-backtest-data", "Stack": stack},
 )
 
-replay_table = aws.dynamodb.Table(
-    "replay-table",
-    name=f"{prefix}-replays-{stack}",
-    billing_mode="PAY_PER_REQUEST",
-    hash_key="replay_id",
-    attributes=[aws.dynamodb.TableAttributeArgs(name="replay_id", type="S")],
-    tags={"Project": "poochon-backtest-data", "Stack": stack},
-)
-
-replay_shard_table = aws.dynamodb.Table(
+# Shard table keeps its legacy AWS name (`replay-shards-...`) to avoid recreating
+# the table and losing existing shard records. Logical Pulumi name and exports
+# both use the simpler `shard_table` term to match the new code.
+shard_table = aws.dynamodb.Table(
     "replay-shard-table",
     name=f"{prefix}-replay-shards-{stack}",
     billing_mode="PAY_PER_REQUEST",
@@ -72,6 +66,5 @@ replay_shard_table = aws.dynamodb.Table(
 
 pulumi.export("data_bucket_name", data_bucket.bucket)
 pulumi.export("coverage_table_name", coverage_table.name)
-pulumi.export("replay_table_name", replay_table.name)
-pulumi.export("replay_shard_table_name", replay_shard_table.name)
+pulumi.export("shard_table_name", shard_table.name)
 pulumi.export("aws_account_id", aws_account_id)

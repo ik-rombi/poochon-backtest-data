@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import io
 import json
 from typing import Any, Iterator
@@ -16,14 +15,17 @@ from .models import (
     CoverageRecord,
     DatasetKind,
     MarketRef,
-    OutcomesMode,
+    PolymarketTarget,
     Venue,
-    canonical_hyperliquid_shard_id,
-    canonical_polymarket_shard_id,
-    coverage_pk,
+    canonical_hl_shard_id,
+    canonical_pm_shard_id,
+    coverage_pk_canonical_hl,
+    coverage_pk_canonical_pm,
+    coverage_pk_raw_hl_fills,
+    coverage_pk_raw_hl_l2,
+    coverage_pk_raw_pmxt,
     iter_dates_inclusive,
 )
-from .models import ReplayRecord
 
 S3_CLIENT_CONFIG = Config(max_pool_connections=64)
 DYNAMODB_BATCH_GET_LIMIT = 100
@@ -70,9 +72,26 @@ class S3Store:
             extra["ExtraArgs"] = {"ContentType": content_type}
         self.client.upload_file(path, self.bucket, key, **extra)
 
-    def get_bytes(self, key: str) -> bytes:
-        response = self.client.get_object(Bucket=self.bucket, Key=key)
-        return response["Body"].read()
+    def get_bytes(self, key: str, *, max_retries: int = 5) -> bytes:
+        """Download an S3 object as bytes, with retries on mid-stream connection drops."""
+        from botocore.exceptions import ClientError, ConnectionClosedError, ResponseStreamingError
+        from http.client import IncompleteRead
+        import time
+
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                response = self.client.get_object(Bucket=self.bucket, Key=key)
+                return response["Body"].read()
+            except (ResponseStreamingError, ConnectionClosedError, IncompleteRead, ConnectionResetError) as error:
+                last_error = error
+                if attempt + 1 < max_retries:
+                    backoff = 2 ** attempt
+                    time.sleep(backoff)
+            except ClientError:
+                raise
+        assert last_error is not None
+        raise last_error
 
     def exists(self, key: str) -> bool:
         return self.object_size(key) is not None
@@ -143,57 +162,51 @@ class CoverageRepository:
                 request = response.get("UnprocessedKeys") or {}
         return result
 
-    def list_window(
+    def list_raw_pmxt_window(
         self,
         *,
-        dataset_kind: DatasetKind,
-        market: MarketRef,
         start_date: str,
         end_date: str,
-        hours: list[str],
     ) -> dict[tuple[str, str], CoverageRecord | None]:
-        """Return per-(date, hour) coverage records for a window.
-
-        Keys are (date, hour) tuples. Missing cells map to None.
-        """
         dates = iter_dates_inclusive(start_date, end_date)
         pk_to_cell: dict[str, tuple[str, str]] = {}
         for date in dates:
-            for hour in hours:
-                pk = coverage_pk(dataset_kind, market, date, hour)
-                pk_to_cell[pk] = (date, hour)
+            for hour in range(24):
+                pk = coverage_pk_raw_pmxt(date, hour)
+                pk_to_cell[pk] = (date, f"{hour:02d}")
         records = self.batch_get(list(pk_to_cell))
         return {cell: records[pk] for pk, cell in pk_to_cell.items()}
 
+    def list_raw_hl_l2_window(
+        self,
+        *,
+        market: MarketRef,
+        start_date: str,
+        end_date: str,
+    ) -> dict[tuple[str, str], CoverageRecord | None]:
+        dates = iter_dates_inclusive(start_date, end_date)
+        pk_to_cell: dict[str, tuple[str, str]] = {}
+        for date in dates:
+            for hour in range(24):
+                pk = coverage_pk_raw_hl_l2(market, date, hour)
+                pk_to_cell[pk] = (date, f"{hour:02d}")
+        records = self.batch_get(list(pk_to_cell))
+        return {cell: records[pk] for pk, cell in pk_to_cell.items()}
 
-class ReplayRepository:
-    def __init__(self, session: boto3.session.Session, table_name: str):
-        self.table = session.resource("dynamodb").Table(table_name)
-
-    def get(self, replay_id: str) -> ReplayRecord | None:
-        response = self.table.get_item(Key={"replay_id": replay_id})
-        item = response.get("Item")
-        if not item:
-            return None
-        return ReplayRecord.model_validate(item)
-
-    def create_if_absent(self, record: ReplayRecord) -> ReplayRecord:
-        try:
-            self.table.put_item(
-                Item=record.model_dump(mode="json"),
-                ConditionExpression="attribute_not_exists(replay_id)",
-            )
-            return record
-        except ClientError as error:
-            if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
-                raise
-            existing = self.get(record.replay_id)
-            if existing is None:
-                raise
-            return existing
-
-    def put(self, record: ReplayRecord) -> None:
-        self.table.put_item(Item=record.model_dump(mode="json"))
+    def list_raw_hl_fills_window(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+    ) -> dict[tuple[str, str], CoverageRecord | None]:
+        dates = iter_dates_inclusive(start_date, end_date)
+        pk_to_cell: dict[str, tuple[str, str]] = {}
+        for date in dates:
+            for hour in range(24):
+                pk = coverage_pk_raw_hl_fills(date, hour)
+                pk_to_cell[pk] = (date, f"{hour:02d}")
+        records = self.batch_get(list(pk_to_cell))
+        return {cell: records[pk] for pk, cell in pk_to_cell.items()}
 
 
 class CanonicalShardRepository:
@@ -232,7 +245,7 @@ class CanonicalShardRepository:
                 request = response.get("UnprocessedKeys") or {}
         return result
 
-    def list_hyperliquid_window(
+    def list_hl_window(
         self,
         *,
         market: MarketRef,
@@ -241,25 +254,22 @@ class CanonicalShardRepository:
         depth: int,
     ) -> dict[str, CanonicalShardRecord | None]:
         shard_ids = {
-            date: canonical_hyperliquid_shard_id(market, date, depth)
+            date: canonical_hl_shard_id(market, date, depth)
             for date in iter_dates_inclusive(start_date, end_date)
         }
         records = self.batch_get(list(shard_ids.values()))
         return {date: records[sid] for date, sid in shard_ids.items()}
 
-    def list_polymarket_window(
+    def list_pm_window(
         self,
         *,
-        series_key: str,
-        outcomes: OutcomesMode,
+        target: PolymarketTarget,
         start_date: str,
         end_date: str,
         depth: int,
     ) -> dict[str, CanonicalShardRecord | None]:
         shard_ids = {
-            date: canonical_polymarket_shard_id(
-                series_key=series_key, date=date, outcomes=outcomes, depth=depth
-            )
+            date: canonical_pm_shard_id(target=target, date=date, depth=depth)
             for date in iter_dates_inclusive(start_date, end_date)
         }
         records = self.batch_get(list(shard_ids.values()))

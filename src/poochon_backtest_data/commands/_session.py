@@ -32,10 +32,3 @@ def open_session() -> SessionBundle:
         coverage_repo=CoverageRepository(session, settings.coverage_table_name),
         shard_repo=CanonicalShardRepository(session, settings.shard_table_name),
     )
-
-
-def require_telonex_api_key() -> str:
-    settings = get_settings()
-    if not settings.telonex_api_key:
-        raise RuntimeError("POOCHON_TELONEX_API_KEY is required")
-    return settings.telonex_api_key

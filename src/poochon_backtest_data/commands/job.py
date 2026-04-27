@@ -23,6 +23,14 @@ _VALID_STATUSES = (
 )
 
 
+_KIND_TO_OUTPUT_KEY = {
+    "pm-mirror": "pm_mirror_state_machine_arn",
+    "pm-slice": "pm_slice_state_machine_arn",
+    "hl-mirror": "hl_mirror_state_machine_arn",
+    "hl-slice": "hl_slice_state_machine_arn",
+}
+
+
 def register(subparsers) -> None:
     parser = subparsers.add_parser(name, help="Inspect Step Functions executions")
     job_subparsers = parser.add_subparsers(dest="job_command", required=True)
@@ -31,6 +39,12 @@ def register(subparsers) -> None:
     list_parser.add_argument("--limit", type=int, default=10)
     list_parser.add_argument("--status", choices=list(_VALID_STATUSES))
     list_parser.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
+    list_parser.add_argument(
+        "--kind",
+        choices=list(_KIND_TO_OUTPUT_KEY) + ["all"],
+        default="all",
+        help="Which state machine to query; defaults to all",
+    )
     list_parser.add_argument("--state-machine-arn", default=None)
     list_parser.add_argument("--json", action="store_true", dest="as_json")
 
@@ -83,37 +97,66 @@ def _iso(ts):
 
 
 def _handle_list(args: Namespace) -> int:
-    try:
-        state_machine_arn = resolve_state_machine_arn(args.stack, args.state_machine_arn)
-    except RuntimeError as error:
-        print(f"error: {error}", file=sys.stderr)
+    if args.state_machine_arn:
+        groups = [(args.kind if args.kind != "all" else "explicit", args.state_machine_arn)]
+    elif args.kind == "all":
+        groups = []
+        for kind, output_key in _KIND_TO_OUTPUT_KEY.items():
+            try:
+                arn = resolve_state_machine_arn(args.stack, output_key)
+                groups.append((kind, arn))
+            except RuntimeError as error:
+                print(f"warning: skipping {kind}: {error}", file=sys.stderr)
+    else:
+        try:
+            arn = resolve_state_machine_arn(args.stack, _KIND_TO_OUTPUT_KEY[args.kind])
+        except RuntimeError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        groups = [(args.kind, arn)]
+
+    if not groups:
+        print("no state machines found", file=sys.stderr)
         return 1
 
-    kwargs = {"stateMachineArn": state_machine_arn, "maxResults": args.limit}
-    if args.status:
-        kwargs["statusFilter"] = args.status
-
-    response = _sfn_client().list_executions(**kwargs)
-    executions = response.get("executions", [])
+    sfn = _sfn_client()
+    output_groups: list[tuple[str, list[dict]]] = []
+    for kind, arn in groups:
+        kwargs = {"stateMachineArn": arn, "maxResults": args.limit}
+        if args.status:
+            kwargs["statusFilter"] = args.status
+        response = sfn.list_executions(**kwargs)
+        output_groups.append((kind, response.get("executions", [])))
 
     if args.as_json:
-        print(json.dumps([{
-            "execution_arn": e["executionArn"],
-            "name": e["name"],
-            "status": e["status"],
-            "start_date": _iso(e.get("startDate")),
-            "stop_date": _iso(e.get("stopDate")),
-        } for e in executions], indent=2, default=str))
+        payload = []
+        for kind, executions in output_groups:
+            for e in executions:
+                payload.append(
+                    {
+                        "kind": kind,
+                        "execution_arn": e["executionArn"],
+                        "name": e["name"],
+                        "status": e["status"],
+                        "start_date": _iso(e.get("startDate")),
+                        "stop_date": _iso(e.get("stopDate")),
+                    }
+                )
+        print(json.dumps(payload, indent=2, default=str))
         return 0
 
-    if not executions:
+    any_executions = False
+    for kind, executions in output_groups:
+        if not executions:
+            continue
+        any_executions = True
+        print(f"\n[{kind}]")
+        for e in executions:
+            start = _iso(e.get("startDate")) or "-"
+            stop = _iso(e.get("stopDate")) or "-"
+            print(f"  {e['status']:10}  {start:30}  {stop:30}  {e['name']}")
+    if not any_executions:
         print("no executions found")
-        return 0
-
-    for e in executions:
-        start = _iso(e.get("startDate")) or "-"
-        stop = _iso(e.get("stopDate")) or "-"
-        print(f"{e['status']:10}  {start:30}  {stop:30}  {e['name']}")
     return 0
 
 
@@ -210,7 +253,7 @@ def _handle_logs(args: Namespace) -> int:
         return 1
 
     task_id = task_info["task_arn"].split("/")[-1]
-    log_group = args.log_group or _discover_log_group(args.stack)
+    log_group = args.log_group or os.environ.get("POOCHON_LOG_GROUP") or _discover_log_group(args.stack)
     if not log_group:
         print(
             "could not determine log group; pass --log-group or set POOCHON_INGESTION_LOG_GROUP",

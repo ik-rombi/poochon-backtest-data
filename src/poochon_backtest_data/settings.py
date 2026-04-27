@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,16 +7,23 @@ class Settings(BaseSettings):
     app_name: str = "poochon-backtest-data"
     aws_region: str = "eu-west-1"
     log_level: str = "INFO"
-    port: int = 8080
 
     data_bucket: str | None = None
     coverage_table_name: str | None = None
-    replay_table_name: str | None = None
     shard_table_name: str | None = None
-    replay_state_machine_arn: str | None = None
-    telonex_api_key: str | None = None
 
-    request_payer: str = Field(default="requester")
+    pmxt_base_url: str = "https://r2v2.pmxt.dev"
+    gamma_base_url: str = "https://gamma-api.polymarket.com"
+    vatic_base_url: str = "https://api.vatic.trading"
+    binance_base_url: str = "https://api.binance.com"
+    binance_us_base_url: str = "https://api.binance.us"
+
+    pm_mirror_state_machine_arn: str | None = None
+    pm_slice_state_machine_arn: str | None = None
+    hl_mirror_state_machine_arn: str | None = None
+    hl_slice_state_machine_arn: str | None = None
+
+    request_payer: str = "requester"
 
     model_config = SettingsConfigDict(
         env_prefix="POOCHON_",
