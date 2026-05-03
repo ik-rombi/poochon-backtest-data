@@ -363,6 +363,17 @@ def build_pm_slice(
             f"{target.target_key} date={date}"
         )
     schedule_table = _build_schedule_table(target, resolutions)
+    if (
+        force
+        and existing is not None
+        and existing.schedule_file is not None
+        and schedule_table.num_rows < existing.schedule_file.row_count
+    ):
+        raise RuntimeError(
+            f"refusing to shrink Polymarket schedule for target={target.target_kind.value}:"
+            f"{target.target_key} date={date}: discovered {schedule_table.num_rows} "
+            f"contract rows, existing shard has {existing.schedule_file.row_count}"
+        )
     asset_to_instrument = {res.asset_id: res.instrument for res in resolutions}
     asset_ids = list(asset_to_instrument)
     stats.contracts_discovered = len({res.slug for res in resolutions})
