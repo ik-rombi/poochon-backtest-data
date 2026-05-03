@@ -102,12 +102,12 @@ aws.ec2.RouteTableAssociation(
     route_table_id=route_table.id,
 )
 
-# Task SG allows ingress within the VPC on 8080 (so the ALB in infra/read can
-# reach the api service) and unrestricted egress.
+# Task SG allows ingress within the VPC on 8080 for runtime/API tasks and
+# unrestricted egress.
 task_sg = aws.ec2.SecurityGroup(
     "shared-task-sg",
     vpc_id=vpc.id,
-    description="ECS task security group (shared between sync and api tasks)",
+    description="ECS task security group (shared by runtime tasks)",
     ingress=[
         aws.ec2.SecurityGroupIngressArgs(
             protocol="tcp",

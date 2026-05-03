@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "poochon-backtest-data"
-    aws_region: str = "eu-west-1"
+    aws_region: str = "us-east-1"
     log_level: str = "INFO"
 
     data_bucket: str | None = None

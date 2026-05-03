@@ -38,7 +38,7 @@ def register(subparsers) -> None:
     list_parser = job_subparsers.add_parser("list", help="List recent executions")
     list_parser.add_argument("--limit", type=int, default=10)
     list_parser.add_argument("--status", choices=list(_VALID_STATUSES))
-    list_parser.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
+    list_parser.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"))
     list_parser.add_argument(
         "--kind",
         choices=list(_KIND_TO_OUTPUT_KEY) + ["all"],
@@ -55,7 +55,7 @@ def register(subparsers) -> None:
     logs = job_subparsers.add_parser("logs", help="Tail CloudWatch logs for an execution's task")
     logs.add_argument("execution_arn")
     logs.add_argument("--follow", action="store_true")
-    logs.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
+    logs.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"))
     logs.add_argument("--log-group", default=os.environ.get("POOCHON_INGESTION_LOG_GROUP"),
                       help="CloudWatch log group; default discovered from Pulumi shared stack output")
 

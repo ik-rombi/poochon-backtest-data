@@ -37,7 +37,7 @@ def boto3_session(region: str):
 
 class S3Store:
     def __init__(self, session: boto3.session.Session, bucket: str):
-        self.region = session.region_name or "eu-west-1"
+        self.region = session.region_name or "us-east-1"
         self.bucket = bucket
         self.client = session.client("s3", config=S3_CLIENT_CONFIG)
 
@@ -128,7 +128,7 @@ class S3Store:
 
 class CoverageRepository:
     def __init__(self, session: boto3.session.Session, table_name: str):
-        self.region = session.region_name or "eu-west-1"
+        self.region = session.region_name or "us-east-1"
         self.table_name = table_name
         self.table = session.resource("dynamodb").Table(table_name)
 
@@ -211,7 +211,7 @@ class CoverageRepository:
 
 class CanonicalShardRepository:
     def __init__(self, session: boto3.session.Session, table_name: str):
-        self.region = session.region_name or "eu-west-1"
+        self.region = session.region_name or "us-east-1"
         self.table_name = table_name
         self.table = session.resource("dynamodb").Table(table_name)
 

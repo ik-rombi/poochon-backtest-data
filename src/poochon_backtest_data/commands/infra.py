@@ -11,7 +11,7 @@ import sys
 name = "infra"
 
 # Stacks listed in dependency order; later stacks depend on earlier ones.
-_STACK_PATHS = ("core", "shared", "write", "read", "runtime")
+_STACK_PATHS = ("core", "shared", "runtime", "access")
 
 
 @dataclass
@@ -28,8 +28,8 @@ def register(subparsers) -> None:
     infra_subparsers = parser.add_subparsers(dest="infra_command", required=True)
 
     status = infra_subparsers.add_parser("status", help="Report stack UP/DOWN and key outputs")
-    status.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"),
-                        help="Pulumi stack name (default: $POOCHON_PULUMI_STACK or dev)")
+    status.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"),
+                        help="Pulumi stack name (default: $POOCHON_PULUMI_STACK or dev-east)")
     status.add_argument("--repo-root", default=None,
                         help="Repository root (defaults to $POOCHON_REPO_ROOT or git toplevel)")
     status.add_argument("--json", action="store_true", dest="as_json")
@@ -152,11 +152,12 @@ def _format_output_summary(outputs: dict) -> str:
     keys_of_interest = [
         "data_bucket_name",
         "coverage_table_name",
-        "replay_shard_table_name",
-        "replay_table_name",
-        "ingestion_state_machine_arn",
-        "ingestion_schedule_name",
-        "api_url",
+        "shard_table_name",
+        "pm_mirror_state_machine_arn",
+        "pm_slice_state_machine_arn",
+        "hl_mirror_state_machine_arn",
+        "hl_slice_state_machine_arn",
+        "readBrokerRoleArn",
         "cluster_arn",
         "ecr_repo_url",
     ]

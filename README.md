@@ -4,60 +4,63 @@ AWS-backed historical ingestion and canonical replay materialization for `../bit
 
 This repo owns the data plane that turns venue/provider data into deterministic replay streams:
 
-1. discover markets/contracts
-2. copy or download raw venue data into S3
-3. normalize raw data into a stable parquet schema
-4. materialize canonical replay shards as typed Parquet families plus shard manifests
-5. serve replay window manifests and shard file downloads to consumers
+1. mirror raw venue/provider data into S3
+2. discover market schedules and settlement metadata when a slice needs it
+3. materialize canonical daily replay shards
+4. persist shard catalog records in DynamoDB
+5. broker shard discovery and direct S3 downloads to consumers
 
 ## Stack Layout
 
-Four Pulumi stacks, each with a distinct lifecycle:
+Pulumi stacks are split by lifecycle:
 
 - `infra/core`
   - persistent storage; rarely touched
-  - S3 bucket for raw, normalized, metadata, replay, and canonical artifacts
-  - DynamoDB tables for coverage, replay records, and canonical shard records
+  - S3 bucket for raw and canonical artifacts
+  - DynamoDB tables for coverage records and canonical shard records
 - `infra/shared`
   - shared compute/networking plumbing; ~$0 idle
   - VPC + subnets + IGW, ECS cluster, CloudWatch log group, ECR repo and Docker image, IAM execution/task roles
-- `infra/write`
-  - ingestion control plane; ~$0 idle (Fargate is pay-per-run)
-  - Sync task definition, Step Functions state machine, IAM role for Step Functions, optional EventBridge scheduler, optional Telonex secret
-- `infra/read`
-  - consumer-facing FastAPI; ~$30/mo when up (ALB + 1 Fargate task)
-  - API task definition, ECS service, ALB + target group + listener, ALB security group
-  - **destroy this stack independently when you don't need the API** — `infra/write` keeps working
+- `infra/runtime`
+  - ingestion/materialization jobs; ~$0 idle (Fargate is pay-per-run)
+  - Step Functions state machines and EventBridge schedules for raw mirroring and canonical slice builds
+- `infra/access`
+  - cross-account read broker for Poochon control-plane access
+  - IAM role trusted by the Poochon control-plane role with an ExternalId
+  - read-only DynamoDB catalog access and S3 `GetObject` access to canonical prefixes
 
-Dependency order: `core → shared → (write, read in parallel)`.
+Dependency order: `core → shared → runtime`; `access` depends on `core` and can
+be deployed independently after the Poochon control-plane role ARN is known.
 
-`src/poochon_backtest_data/` holds the ingestion, normalization, canonical build, API, and CLI entrypoints. The same CLI binary runs both on your laptop (for local `run`) and inside Fargate (launched by the state machine).
+`src/poochon_backtest_data/` holds the raw mirror, canonical slice builders, storage/catalog helpers, and CLI entrypoints. The same CLI binary runs both on your laptop (for local `run`) and inside Fargate (launched by the state machine).
 
 Current dev stack defaults:
 
-- region: `eu-west-1`
+- region: `us-east-1`
 - core stack: persistent
 - shared stack: persistent (effectively — kept up because destroy cost = ECR image rebuild)
-- write stack: persistent (~$0 idle)
-- read stack: bring up only when serving consumers
+- runtime stack: persistent scheduler/state-machine definitions with pay-per-run ECS tasks
+- access stack: persistent cross-account read role used by Poochon
 
-## Separating write and read
+## Poochon Control-Plane Broker
 
-The split exists so that turning off the read API doesn't disturb ingestion:
+End-user download access is brokered by the sibling `../poochon` control plane.
+This repo remains the source of truth for S3 and DynamoDB. The `infra/access`
+stack exposes a narrow read-broker role; Poochon assumes it, reads the shard
+catalog, and returns short-lived S3 URLs for canonical shard files. Poochon does
+not proxy Parquet bytes.
 
 ```bash
-# bring up ingestion control plane only
-cd infra/shared && pulumi up --stack dev
-cd infra/write  && pulumi up --stack dev
+cd infra/access
+pulumi up --stack dev-east
+```
 
-# ingest stays live; submit jobs via CLI or state machine directly
-poochon-backtest-data submit hyperliquid --instrument BTC --market-type perp \
-  --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
+The consumer-facing CLI surface lives in `../poochon`:
 
-# later — bring up the read side
-cd infra/read && pulumi up --stack dev
-# … use it …
-cd infra/read && pulumi destroy --stack dev  # stops ALB/API billing
+```bash
+poochon backtest-data list --venue polymarket --series btc-updown-5m
+poochon backtest-data inspect <shard-id>
+poochon backtest-data download <shard-id> --out ./data/backtest
 ```
 
 ## End-To-End Flow
@@ -65,24 +68,22 @@ cd infra/read && pulumi destroy --stack dev  # stops ALB/API billing
 ```text
 Provider / Venue data
   -> raw S3 objects
-  -> normalized parquet
-  -> canonical shard (manifest.json + *.parquet families)
-  -> canonical window manifest
-  -> Parquet family download consumed by bitchon ReplaySource
+  -> canonical shard (manifest.json + data.parquet, plus schedule.parquet for Polymarket)
+  -> DynamoDB shard catalog
+  -> direct S3 file download consumed by bitchon ReplaySource
 ```
 
 There are two venue families today:
 
 - Hyperliquid
   - raw source: Hyperliquid public archive buckets
-  - normalized units: hourly L2 and trade parquet
+  - raw units: hourly L2 and fills archives
   - canonical units: daily shard per instrument/date/depth
 - Polymarket
-  - market discovery: Gamma
-  - historical raw source: Telonex parquet downloads
+  - raw source: PMXT hourly Polymarket orderbook files
+  - schedule discovery: Gamma
   - price-to-beat enrichment: Vatic first, Binance 1-minute open fallback
-  - normalized units: per-market parquet keyed by `market_id`
-  - canonical units: daily shard per `series_key`/date/outcomes/depth
+  - canonical units: daily shard per `series_key`/date/depth
 
 ## Persistent State
 
@@ -90,13 +91,14 @@ There are two venue families today:
 
 - Coverage table
   - keyed by `pk`
-  - tracks whether raw or normalized inputs are ready for a given venue / market / date / hour
-  - canonical key format:
-    - `dataset_kind#venue#market_type#instrument#date#hour`
-- Replay table
-  - keyed by `replay_id`
-  - tracks ad hoc replay builds
-- Replay shard table
+  - tracks whether raw mirror cells and canonical shard builds are ready
+  - key examples:
+    - `raw_pmxt#<YYYY-MM-DD>#<HH>`
+    - `raw_hl_l2#<market_type>#<instrument>#<YYYY-MM-DD>#<HH>`
+    - `raw_hl_fills#<YYYY-MM-DD>#<HH>`
+    - `canonical_pm#<target_kind>#<target_key>#<YYYY-MM-DD>`
+    - `canonical_hl#<market_type>#<instrument>#<YYYY-MM-DD>`
+- Shard table
   - keyed by `shard_id`
   - tracks canonical shard manifests already materialized in S3
 
@@ -104,37 +106,23 @@ There are two venue families today:
 
 - Hyperliquid raw
   - `raw/hyperliquid/l2book/market_type=<...>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/<instrument>.lz4`
-  - `raw/hyperliquid/node_fills_by_block/market_type=<...>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/part-<HH>.lz4`
+  - `raw/hyperliquid/node_fills_by_block/date=<YYYY-MM-DD>/hour=<HH>/fills.lz4`
 - Polymarket raw
-  - `raw/telonex/polymarket/channel=book_snapshot_5/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`
-  - `raw/telonex/polymarket/channel=trades/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`
-- Polymarket metadata
-  - `metadata/polymarket/market_id=<market_id>/instrument=<instrument>/manifest.json`
-- Hyperliquid normalized
-  - `normalized/hyperliquid/l2_snapshot/market_type=<...>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/part-000.parquet`
-  - `normalized/hyperliquid/trade/market_type=<...>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/part-000.parquet`
-- Polymarket normalized
-  - `normalized/polymarket/kind=l2_snapshot/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`
-  - `normalized/polymarket/kind=trade/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`
+  - `raw/pmxt/orderbook/date=<YYYY-MM-DD>/hour=<HH>/polymarket_orderbook_<YYYY-MM-DD>T<HH>.parquet`
 - Canonical replay shards
   - Hyperliquid:
-    - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/trades.parquet`
-    - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/books.parquet`
+    - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/data.parquet`
     - `canonical/hyperliquid/market_type=<...>/instrument=<instrument>/date=<YYYY-MM-DD>/depth=<N>/manifest.json`
   - Polymarket:
-    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/contracts.parquet`
-    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/trades.parquet`
-    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/books.parquet`
-    - `canonical/polymarket/series=<series_key>/outcomes=<mode>/date=<YYYY-MM-DD>/depth=<N>/manifest.json`
-- Replay artifacts
-  - `replays/.../events.jsonl.zst`
-  - `replays/.../manifest.json`
+    - `canonical/polymarket/<series|slug>/<target_key>/date=<YYYY-MM-DD>/depth=<N>/data.parquet`
+    - `canonical/polymarket/<series|slug>/<target_key>/date=<YYYY-MM-DD>/depth=<N>/schedule.parquet`
+    - `canonical/polymarket/<series|slug>/<target_key>/date=<YYYY-MM-DD>/depth=<N>/manifest.json`
 
 ## Data Structures
 
 ### Raw Stage
 
-Raw objects are provider-native payloads. This stage preserves source fidelity and keeps provider-specific parsing isolated from the normalized schema.
+Raw objects are provider-native payloads. This stage preserves source fidelity and keeps provider-specific parsing isolated from the canonical schema.
 
 #### Raw Object Keying
 
@@ -144,37 +132,33 @@ Raw keys are composed from the minimum dimensions needed to make each object uni
 
 Hourly-partitioned, scoped to an instrument:
 
-| Family  | Key dimensions                              | Destination key                                                                                                         |
-| ------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| L2 book | `market_type`, `date`, `hour`, `instrument` | `raw/hyperliquid/l2book/market_type=<…>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/<instrument>.lz4`            |
-| Fills   | `market_type`, `date`, `hour`, `instrument` | `raw/hyperliquid/node_fills_by_block/market_type=<…>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/part-<HH>.lz4` |
+| Family  | Key dimensions                              | Destination key                                                                                              |
+| ------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| L2 book | `market_type`, `date`, `hour`, `instrument` | `raw/hyperliquid/l2book/market_type=<...>/date=<YYYY-MM-DD>/hour=<HH>/instrument=<instrument>/<instrument>.lz4` |
+| Fills   | `date`, `hour`                              | `raw/hyperliquid/node_fills_by_block/date=<YYYY-MM-DD>/hour=<HH>/fills.lz4`                                  |
 
 Notes:
 
 - Sources are requester-pays buckets: `s3://hyperliquid-archive/market_data/YYYYMMDD/<hour>/l2Book/<instrument>.lz4` (L2) and `s3://hl-mainnet-node-data/node_fills_by_block/hourly/YYYYMMDD/<hour>.lz4` (fills).
 - L2 upstream is already instrument-scoped; one upstream object maps to one destination key.
-- Fills upstream is **not** instrument-scoped — it is one `.lz4` per hour covering the whole venue. We still store it under an `instrument=<instrument>` prefix, so the same upstream object is copied once per ingested instrument. Filtering to `coin == <instrument>` happens at normalize time.
+- Fills upstream is **not** instrument-scoped — it is one `.lz4` per hour covering the whole venue. It is mirrored once per hour and filtered to `coin == <instrument>` at slice-build time.
 - `market_type` comes from `MarketRef.market_type` (e.g. `perp`).
 - `instrument` is URL-encoded via `MarketRef.encoded_instrument()`.
 - `date` is the UTC calendar day; `hour` is the zero-padded UTC hour.
 
 ##### Polymarket
 
-Daily-partitioned, scoped to a single outcome contract:
+Hourly-partitioned PMXT firehose data, not scoped to one market:
 
-| Family   | Key dimensions                       | Destination key                                                                                                                     |
-| -------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Book     | `market_id`, `instrument`, `date`    | `raw/telonex/polymarket/channel=book_snapshot_5/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`   |
-| Trades   | `market_id`, `instrument`, `date`    | `raw/telonex/polymarket/channel=trades/market_id=<market_id>/instrument=<instrument>/date=<YYYY-MM-DD>/part-000.parquet`            |
-| Metadata | `market_id`, `instrument`            | `metadata/polymarket/market_id=<market_id>/instrument=<instrument>/manifest.json`                                                   |
+| Family    | Key dimensions | Destination key                                                                                              |
+| --------- | -------------- | ------------------------------------------------------------------------------------------------------------ |
+| Orderbook | `date`, `hour` | `raw/pmxt/orderbook/date=<YYYY-MM-DD>/hour=<HH>/polymarket_orderbook_<YYYY-MM-DD>T<HH>.parquet`              |
 
 Notes:
 
-- Source: Telonex REST `GET /<channel>/<date>?market_id=<market_id>&outcome=<outcome>`, Bearer-authed with `POOCHON_TELONEX_API_KEY`.
-- Partitioning is daily because Telonex returns one parquet per `(market_id, outcome, date)`.
-- `market_id` is the on-chain hex address; `instrument` is `<slug>:<outcome>` (e.g. `btc-updown-5m-1771459200:Up`). Both are URL-encoded.
-- Both `market_id` and `instrument` appear in the key even though the former implies the latter — listings stay scoped either way, and raw/normalized key shapes stay symmetric.
-- A 404 from Telonex is written as an **empty parquet** at the canonical key so downstream stages always see a uniform input shape.
+- Source: PMXT `GET /polymarket_orderbook_<YYYY-MM-DD>T<HH>.parquet`.
+- The mirror stage writes one raw object per hour. Canonical slice builders filter those hourly files by target asset ids after discovering the target schedule.
+- The current hour is skipped until a publish-lag buffer has passed, so scheduled mirrors do not mark not-yet-published files as permanent failures.
 
 #### Hyperliquid Raw
 
@@ -189,201 +173,82 @@ Hyperliquid raw is intentionally not restated as a stable schema in this repo be
 
 #### Polymarket Raw
 
-Polymarket raw data is parquet from Telonex with fixed schemas.
-
-`book_snapshot_5` columns:
-
-```text
-timestamp_us
-local_timestamp_us
-exchange
-market_id
-slug
-asset_id
-outcome
-bid_price_0..4
-bid_size_0..4
-ask_price_0..4
-ask_size_0..4
-```
-
-`trades` columns:
+Polymarket raw data is PMXT parquet. The canonical builder currently consumes
+these fields:
 
 ```text
-timestamp_us
-local_timestamp_us
-exchange
-market_id
-slug
+timestamp
 asset_id
-outcome
+event_type
+bids
+asks
 price
 size
 side
-trade_id
-origin_asset_id
 ```
 
-#### Polymarket Metadata Manifest
+Supported `event_type` values are translated into canonical data rows:
 
-Each discovered outcome contract is also stored as a JSON manifest. The persisted fields are:
+- `book` -> `l2_snapshot`
+- `price_change` -> `delta_batch`
+- `last_trade_price` -> `trade`
 
-```json
-{
-  "venue": "polymarket",
-  "market_type": "binary",
-  "slug": "btc-updown-5m-1771459200",
-  "question": "Bitcoin Up or Down - ...",
-  "outcome": "Up",
-  "market_id": "0x...",
-  "asset_id": "9936...",
-  "instrument": "btc-updown-5m-1771459200:Up",
-  "start_time": "2026-02-19T00:00:00+00:00",
-  "end_time": "2026-02-19T00:05:00+00:00",
-  "start_ts_ms": 1771459200000,
-  "end_ts_ms": 1771459500000,
-  "dates": ["2026-02-19"],
-  "price_to_beat": 66461.0,
-  "price_to_beat_source": "binance_us_open_1m",
-  "price_to_beat_quality": "proxy"
-}
-```
+#### Polymarket Schedule Data
 
-Notes:
+Polymarket slices discover market schedule rows at build time using Gamma, Vatic,
+and Binance fallbacks. `series_key` is derived from `slug` by trimming the
+trailing timestamp segment, and `start_ts_ms` / `end_ts_ms` are contract-window
+timestamps, not Gamma listing timestamps.
 
-- `series_key` is derived from `slug` by trimming the trailing timestamp segment.
-- `start_ts_ms` and `end_ts_ms` are contract-window timestamps, not Gamma listing timestamps.
-- `price_to_beat_source`
-  - `vatic` means exact source
-  - `binance_open_1m` means proxy fallback from Binance global
-  - `binance_us_open_1m` means proxy fallback from Binance US
-- `price_to_beat_quality`
-  - `exact`
-  - `proxy`
+### Canonical Slice Stage
 
-### Normalized Stage
+Canonical replay is a manifest-rooted Parquet dataset. This is the stable
+historical format consumed by `../bitchon/bot` replay and backtest flows.
 
-Normalized parquet is the stable intermediate contract used by canonical builders.
+Each Hyperliquid shard emits `data.parquet` and `manifest.json`. Each
+Polymarket shard emits `data.parquet`, `schedule.parquet`, and `manifest.json`.
 
-There are only two normalized row shapes across venues.
-
-#### Normalized L2 Snapshot
+#### `data.parquet`
 
 ```text
 ts_ms
 instrument
-bids_json
-asks_json
-source_hour
-source_line_number
-```
-
-Semantics:
-
-- `ts_ms`
-  - event timestamp in milliseconds
-- `instrument`
-  - venue-specific symbol string
-  - examples:
-    - Hyperliquid: `BTC`
-    - Polymarket: `btc-updown-5m-1771459200:Up`
-- `bids_json` / `asks_json`
-  - JSON-encoded arrays of levels
-  - each level is `{ "px": "...", "sz": "...", "n": <count> }`
-- `source_hour`
-  - original hourly partition for Hyperliquid
-  - `0` for current Polymarket daily objects
-- `source_line_number`
-  - stable tie-breaker used during canonical merge
-
-#### Normalized Trade
-
-```text
-ts_ms
-instrument
-side
+kind
+bids
+asks
+delta_levels
 px
 sz
-hash
-source_hour
-source_line_number
+side
 ```
 
 Semantics:
 
-- `side`
-  - `Buy` or `Sell`
-- `px`
-  - numeric price
-- `sz`
-  - numeric size
-- `hash`
-  - source trade hash or trade id
-- `source_hour` and `source_line_number`
-  - deterministic merge ordering metadata
+- `kind` is `l2_snapshot`, `delta_batch`, or `trade`
+- `bids` / `asks` are depth-limited price levels for full snapshots
+- `delta_levels` contains side/price/size updates for Polymarket price changes
+- `px`, `sz`, and `side` are populated for trade rows
 
-### Canonical Replay Stage
+#### `schedule.parquet`
 
-Canonical replay is a manifest-rooted Parquet dataset. This is the only historical format consumed by `../bitchon/bot` replay and backtest flows.
-
-Each shard emits up to three typed family files.
-
-#### `trades.parquet`
-
-```json
-{
-  "event_seq": 17,
-  "ts_ms": 1771459201234,
-  "instrument": "btc-updown-5m-1771459200:Up",
-  "px": 0.5,
-  "sz": 10.0,
-  "side": "Buy"
-}
+```text
+target_kind
+target_key
+slug
+market_id
+start_ts_ms
+end_ts_ms
+price_to_beat
+price_to_beat_source
+price_to_beat_quality
+outcomes
 ```
 
-#### `books.parquet`
+`schedule.parquet` is Polymarket-only. The `outcomes` field carries outcome,
+asset id, replay instrument, and settlement payout for each side of the binary
+market.
 
-```json
-{
-  "event_seq": 18,
-  "ts_ms": 1771459201234,
-  "instrument": "btc-updown-5m-1771459200:Up",
-  "bid_px_0": 0.49,
-  "bid_sz_0": 10.0,
-  "bid_level_count_0": 0,
-  "ask_px_0": 0.51,
-  "ask_sz_0": 11.0,
-  "ask_level_count_0": 0
-}
-```
-
-Bid and ask columns are flattened per depth level and truncated to the requested canonical depth when the shard is built.
-
-#### `contracts.parquet`
-
-```json
-{
-  "event_seq": 1,
-  "ts_ms": 1771459201000,
-  "kind": "ListedCurrent",
-  "series_key": "btc-updown-5m",
-  "slug": "btc-updown-5m-1771459200",
-  "market_id": "0x...",
-  "start_ts_ms": 1771459200000,
-  "end_ts_ms": 1771459500000,
-  "price_to_beat": 66461.0,
-  "price_to_beat_source": "binance_us_open_1m",
-  "price_to_beat_quality": "proxy",
-  "outcome_0": "Down",
-  "outcome_0_asset_id": "8059...",
-  "outcome_0_instrument": "btc-updown-5m-1771459200:Down",
-  "outcome_1": "Up",
-  "outcome_1_asset_id": "9936...",
-  "outcome_1_instrument": "btc-updown-5m-1771459200:Up"
-}
-```
-
-Contract lifecycle kinds:
+Contract lifecycle events are emitted at replay time from `schedule.parquet`:
 
 - `ListedCurrent`
   - current active contract became visible to the stream
@@ -401,16 +266,11 @@ Contract lifecycle kinds:
 - live and canonical replay are expected to follow the same lifecycle model
 - canonical builders derive the next contract by looking for the contract whose `start_ts_ms` is exactly one interval after the current contract
 
-### Ordering Rules
+### Consumer Ordering
 
-Canonical merge order is deterministic:
-
-1. `ts_ms` ascending
-2. trade rows before L2 rows when timestamps are equal
-3. source stream order
-4. `source_line_number`
-
-That is why normalized rows carry `source_hour` and `source_line_number`.
+Canonical rows carry `ts_ms` and `kind`; consumers should use those fields when
+they need to merge or order events. The current raw-to-slice pipeline no longer
+writes a normalized intermediate dataset or `source_line_number` columns.
 
 ## CLI And Operational Flow
 
@@ -419,36 +279,36 @@ The CLI is an operator console for the pipeline — it executes stages locally, 
 Required environment:
 
 ```bash
-export POOCHON_AWS_REGION=eu-west-1
-export POOCHON_DATA_BUCKET=poochon-backtest-data-778822980471-eu-west-1-dev
-export POOCHON_COVERAGE_TABLE_NAME=poochon-backtest-data-coverage-dev
-export POOCHON_SHARD_TABLE_NAME=poochon-backtest-data-replay-shards-dev
-export POOCHON_TELONEX_API_KEY=...  # only for polymarket
+export POOCHON_AWS_REGION=us-east-1
+export POOCHON_PULUMI_STACK=dev-east
+export POOCHON_DATA_BUCKET="$(cd infra/core && pulumi stack output data_bucket_name --stack dev-east)"
+export POOCHON_COVERAGE_TABLE_NAME="$(cd infra/core && pulumi stack output coverage_table_name --stack dev-east)"
+export POOCHON_SHARD_TABLE_NAME="$(cd infra/core && pulumi stack output shard_table_name --stack dev-east)"
 ```
 
 ### Command tree
 
 ```
 poochon-backtest-data
-├── api                             # serve FastAPI (consumer read API)
 ├── infra
 │   └── status                      # UP/DOWN per Pulumi stack + key outputs
 ├── data
-│   ├── inventory                   # expected/ready/failed/missing per stage
-│   └── coverage                    # dump DDB coverage rows by pk prefix
-├── run                             # execute a stage LOCALLY (blocks)
-│   ├── hyperliquid {raw|normalize|canonical|all}
-│   └── polymarket  {discover|raw|normalize|canonical|all}
-├── submit                          # start a Step Functions execution on AWS
-│   ├── hyperliquid
-│   └── polymarket
+│   ├── hyperliquid {raw|slice}      # inspect mirrored raw data and canonical slices
+│   └── polymarket  {raw|slice}
+├── run                             # execute mirror/slice work locally (blocks)
+│   ├── hyperliquid {mirror|slice|all}
+│   └── polymarket  {mirror|slice|all}
+├── submit                          # start runtime Step Functions executions on AWS
+│   ├── hyperliquid {mirror|slice}
+│   └── polymarket  {mirror|slice}
+├── schedule                        # inspect EventBridge schedules
+│   ├── list
+│   └── next
 └── job                             # track AWS executions
     ├── list
     ├── status <execution-arn>
     └── logs <execution-arn> [--follow]
 ```
-
-The legacy flat commands (`hyperliquid-sync-window`, `polymarket-sync-series`, etc.) still work as deprecated aliases so existing Step Functions state machines keep running during the transition.
 
 ### Canonical walkthrough
 
@@ -457,14 +317,13 @@ The legacy flat commands (`hyperliquid-sync-window`, `polymarket-sync-series`, e
 poochon-backtest-data infra status
 
 # 2. Run a single stage locally — idempotent, so re-running is a no-op.
-poochon-backtest-data run hyperliquid raw \
+poochon-backtest-data run hyperliquid mirror \
   --market-type perp --instrument BTC \
   --start-date 2026-02-19 --end-date 2026-02-19
 
 # 3. Check what landed.
-poochon-backtest-data data inventory \
-  --venue hyperliquid --market-type perp --instrument BTC \
-  --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
+poochon-backtest-data data hyperliquid raw BTC/perp \
+  --start-date 2026-02-19 --end-date 2026-02-19
 
 # 4. Full stream, same window.
 poochon-backtest-data run hyperliquid all \
@@ -472,7 +331,10 @@ poochon-backtest-data run hyperliquid all \
   --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
 
 # 5. Same thing on AWS instead of your laptop.
-poochon-backtest-data submit hyperliquid \
+poochon-backtest-data submit hyperliquid mirror \
+  --market-type perp --instrument BTC \
+  --start-date 2026-02-19 --end-date 2026-02-19
+poochon-backtest-data submit hyperliquid slice \
   --market-type perp --instrument BTC \
   --start-date 2026-02-19 --end-date 2026-02-19 --depth 20
 # → prints execution ARN
@@ -486,55 +348,58 @@ poochon-backtest-data job logs <execution-arn> --follow
 
 ```bash
 poochon-backtest-data run polymarket all \
-  --series btc-updown-5m \
+  --target series:btc-updown-5m \
   --start-date 2026-02-19 --end-date 2026-02-21 \
-  --outcomes both --depth 5
+  --force
 ```
 
-This discovers contracts, writes metadata manifests, downloads missing raw Telonex parquet, normalizes per-market parquet, and force-rebuilds the canonical daily shards. Every sub-stage is individually callable (`run polymarket discover`, `run polymarket raw`, etc.) if you want to isolate a step.
+This mirrors PMXT raw firehose data for the requested window, then builds
+canonical daily slices for the target. Each sub-stage is individually callable
+(`run polymarket mirror`, `run polymarket slice`) if you want to isolate a step.
 
 ### Stack Lifecycle
 
-Bring the ingestion path up (one-time):
+Bring the persistent runtime path up:
 
 ```bash
-cd infra/shared && pulumi up --stack dev
-cd infra/write  && pulumi up --stack dev
+(cd infra/core && pulumi up --stack dev-east)
+(cd infra/shared && pulumi up --stack dev-east)
+(cd infra/runtime && pulumi up --stack dev-east)
 ```
 
-Bring the read API up (only when needed):
+Expose read-only catalog and canonical shard access to the Poochon control
+plane after the control-plane role ARN is known:
 
 ```bash
-cd infra/read && pulumi up --stack dev
+(cd infra/access && pulumi up --stack dev-east)
 ```
 
-Take the read API down without touching ingestion:
+Take down the broker without touching ingestion or stored data:
 
 ```bash
-cd infra/read && pulumi destroy --yes --stack dev
+(cd infra/access && pulumi destroy --yes --stack dev-east)
 ```
 
-Full teardown of the ephemeral side (keeps `infra/core` data):
+Full teardown of the non-data side (keeps `infra/core` data):
 
 ```bash
-cd infra/read   && pulumi destroy --yes --stack dev
-cd infra/write  && pulumi destroy --yes --stack dev
-cd infra/shared && pulumi destroy --yes --stack dev
+(cd infra/access && pulumi destroy --yes --stack dev-east)
+(cd infra/runtime && pulumi destroy --yes --stack dev-east)
+(cd infra/shared && pulumi destroy --yes --stack dev-east)
 ```
 
-Destroying any of `shared`, `write`, or `read` must not touch `infra/core`:
+Destroying any of `shared`, `runtime`, or `access` must not touch `infra/core`:
 
 - S3 bucket
 - coverage table
-- replay table
-- replay-shard table
+- shard table
 
 ## Consumer Contract
 
 `../bitchon/bot` should treat canonical replay as the stable integration boundary.
 
 - raw provider payloads are not a consumer contract
-- normalized parquet is an internal data-plane contract
-- canonical replay manifest + Parquet families are the consumer-facing replay contract
+- canonical `data.parquet`, optional `schedule.parquet`, and `manifest.json` are the replay contract
+- Poochon brokers catalog discovery and short-lived S3 downloads; this repo remains the data source of truth
 
 If replay behavior changes, update this README first and keep `bitchon` live/replay semantics aligned.

@@ -36,7 +36,7 @@ def register(subparsers) -> None:
         s.add_argument("--date")
         if stage_name == "slice":
             s.add_argument("--target", required=True, help="series:KEY or slug:KEY")
-        s.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
+        s.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"))
         s.add_argument("--state-machine-arn", default=None)
         s.set_defaults(_pulumi_output_key=output_key)
 
@@ -60,7 +60,7 @@ def register(subparsers) -> None:
         )
         if stage_name == "slice":
             s.add_argument("--depth", type=int, default=20)
-        s.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
+        s.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"))
         s.add_argument("--state-machine-arn", default=None)
         s.set_defaults(_pulumi_output_key=output_key)
 
@@ -168,11 +168,9 @@ def resolve_state_machine_arn(args_or_stack, output_key: str | None = None, expl
 
 
 def _pulumi_output(stack: str, output_name: str) -> str:
-    runtime_dir = _find_stack_dir(["runtime", "write"])
+    runtime_dir = _find_stack_dir(["runtime"])
     if runtime_dir is None:
-        raise RuntimeError(
-            "cannot locate infra/runtime or infra/write; set --state-machine-arn"
-        )
+        raise RuntimeError("cannot locate infra/runtime; set --state-machine-arn")
     try:
         result = subprocess.run(
             ["pulumi", "stack", "output", output_name, "--stack", stack],
