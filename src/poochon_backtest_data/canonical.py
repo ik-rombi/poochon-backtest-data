@@ -519,6 +519,8 @@ _PMXT_TRANSLATE_SQL_TEMPLATE = """
 WITH filtered AS (
     SELECT
         CAST(epoch_ms(p.timestamp) AS BIGINT) AS ts_ms,
+        CAST({source_hour} AS UTINYINT) AS source_hour,
+        p.file_row_number AS source_row_number,
         l.instrument,
         p.event_type,
         p.bids,
@@ -530,13 +532,15 @@ WITH filtered AS (
             WHEN UPPER(p.side) = 'SELL' THEN 'Sell'
             ELSE NULL
         END AS side_norm
-    FROM read_parquet(?) AS p
+    FROM read_parquet(?, file_row_number=true) AS p
     INNER JOIN asset_lookup AS l USING (asset_id)
     WHERE p.event_type IN ('book', 'price_change', 'last_trade_price')
 ),
 parsed AS (
     SELECT
         ts_ms,
+        source_hour,
+        source_row_number,
         instrument,
         CASE event_type
             WHEN 'book'             THEN 'l2_snapshot'
@@ -581,6 +585,8 @@ parsed AS (
 )
 SELECT
     ts_ms,
+    source_hour,
+    source_row_number,
     instrument,
     kind,
     bids,
@@ -595,6 +601,14 @@ WHERE
     (kind = 'delta_batch'  AND delta_levels IS NOT NULL) OR
     (kind = 'trade'        AND px IS NOT NULL AND sz IS NOT NULL AND side IS NOT NULL)
 """
+
+
+def _duckdb_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _duckdb_string_list(values: Iterable[str]) -> str:
+    return "[" + ", ".join(_duckdb_literal(value) for value in values) + "]"
 
 
 def _slice_pmxt_for_date(
@@ -613,10 +627,12 @@ def _slice_pmxt_for_date(
       - download the PMXT file from S3 to a local temp file
       - run a DuckDB SQL pipeline (filter by asset_id, translate event_type → kind,
         parse JSON bids/asks for `book`, vectorize `price_change`/`last_trade_price`)
-      - stream-append the result as a row group to `data_parquet_path`
+      - write an hourly translated temp parquet carrying hidden source-order columns
+    The final day file is globally sorted by `ts_ms`, then raw PMXT source order.
 
-    Memory stays bounded because DuckDB processes batches; the local PMXT temp
-    file is removed after each hour. Returns total rows written.
+    Memory stays bounded because raw PMXT files are processed one hour at a
+    time; only translated temp parquet files remain until the final sort.
+    Returns total rows written.
     """
     import duckdb
 
@@ -626,16 +642,18 @@ def _slice_pmxt_for_date(
             "instrument": list(asset_to_instrument.values()),
         }
     )
-    sql = _PMXT_TRANSLATE_SQL_TEMPLATE.format(depth=depth)
     rows_out_total = 0
-    writer: pq.ParquetWriter | None = None
     con = duckdb.connect(":memory:")
     try:
-        con.execute("INSTALL json; LOAD json;")
-        con.register("asset_lookup", asset_lookup)
-
         with tempfile.TemporaryDirectory(prefix=f"pmxt-day-{date}-") as work_dir_raw:
             work_dir = Path(work_dir_raw)
+            duckdb_temp = work_dir / "duckdb-tmp"
+            duckdb_temp.mkdir()
+            con.execute("INSTALL json; LOAD json;")
+            con.execute(f"SET temp_directory = {_duckdb_literal(str(duckdb_temp))}")
+            con.register("asset_lookup", asset_lookup)
+            translated_paths: list[Path] = []
+
             for hour in range(24):
                 hour_payload = _fetch_pmxt_payload(s3_store, date, hour)
                 stats.bytes_in += len(hour_payload)
@@ -645,23 +663,27 @@ def _slice_pmxt_for_date(
                 del hour_payload
 
                 translate_started = perf_counter()
-                hour_table = con.execute(sql, [str(hour_path)]).to_arrow_table()
+                translated_path = work_dir / f"translated-{date}-{hour:02d}.parquet"
+                sql = _PMXT_TRANSLATE_SQL_TEMPLATE.format(
+                    depth=depth,
+                    source_hour=hour,
+                )
+                con.execute(
+                    f"""
+                    COPY ({sql})
+                    TO {_duckdb_literal(str(translated_path))}
+                    (FORMAT PARQUET, COMPRESSION ZSTD)
+                    """,
+                    [str(hour_path)],
+                )
                 stats.translate_seconds += perf_counter() - translate_started
 
-                hour_rows = hour_table.num_rows
+                hour_rows = pq.ParquetFile(translated_path).metadata.num_rows
                 if hour_rows > 0:
-                    if writer is None:
-                        writer = pq.ParquetWriter(
-                            data_parquet_path,
-                            schema=DATA_PARQUET_SCHEMA,
-                            compression="zstd",
-                            use_dictionary=["instrument", "kind", "side"],
-                        )
-                    # Cast to canonical schema in case DuckDB inferred slightly different types
-                    hour_table = hour_table.cast(DATA_PARQUET_SCHEMA)
-                    writer.write_table(hour_table)
+                    translated_paths.append(translated_path)
                     rows_out_total += hour_rows
-                del hour_table
+                else:
+                    translated_path.unlink(missing_ok=True)
                 hour_path.unlink(missing_ok=True)
 
                 logger.info(
@@ -673,18 +695,40 @@ def _slice_pmxt_for_date(
                     rows_out_total,
                 )
 
-        if writer is None:
-            # No rows for any hour — still write an empty data.parquet so the
-            # consumer never sees a missing file.
-            writer = pq.ParquetWriter(
-                data_parquet_path,
-                schema=DATA_PARQUET_SCHEMA,
-                compression="zstd",
-                use_dictionary=["instrument", "kind", "side"],
-            )
+            if translated_paths:
+                files = _duckdb_string_list(str(path) for path in translated_paths)
+                con.execute(
+                    f"""
+                    COPY (
+                        SELECT
+                            ts_ms,
+                            instrument,
+                            kind,
+                            bids,
+                            asks,
+                            delta_levels,
+                            px,
+                            sz,
+                            side
+                        FROM read_parquet({files}, union_by_name=true)
+                        ORDER BY ts_ms, source_hour, source_row_number
+                    )
+                    TO {_duckdb_literal(str(data_parquet_path))}
+                    (FORMAT PARQUET, COMPRESSION ZSTD)
+                    """
+                )
+            else:
+                empty_table = pa.Table.from_pydict(
+                    {field.name: [] for field in DATA_PARQUET_SCHEMA},
+                    schema=DATA_PARQUET_SCHEMA,
+                )
+                pq.write_table(
+                    empty_table,
+                    data_parquet_path,
+                    compression="zstd",
+                    use_dictionary=["instrument", "kind", "side"],
+                )
     finally:
-        if writer is not None:
-            writer.close()
         con.close()
 
     stats.rows_out = rows_out_total

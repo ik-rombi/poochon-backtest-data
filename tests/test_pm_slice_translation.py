@@ -10,9 +10,11 @@ import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from poochon_backtest_data import canonical as canonical_module
 from poochon_backtest_data.canonical import (
     PMSliceStats,
     _build_schedule_table,
+    _slice_pmxt_for_date,
     _translate_pmxt_payload,
     DATA_PARQUET_SCHEMA,
     SCHEDULE_PARQUET_SCHEMA,
@@ -165,6 +167,109 @@ def test_translate_pmxt_payload_handles_book_delta_and_trade() -> None:
     # Round-trip into the canonical schema cleanly.
     table = pa.Table.from_pydict(out, schema=DATA_PARQUET_SCHEMA)
     assert table.num_rows == 3
+
+
+def test_slice_pmxt_for_date_writes_chronological_day_file(monkeypatch, tmp_path) -> None:
+    asset_id = "asset-1"
+    empty_payload = _make_pmxt_payload([])
+    payloads = {
+        0: _make_pmxt_payload(
+            [
+                {
+                    "timestamp_received": _ts(2_000),
+                    "timestamp": _ts(2_000),
+                    "market": _market_bytes(),
+                    "event_type": "book",
+                    "asset_id": asset_id,
+                    "bids": orjson.dumps([{"price": "0.61", "size": "100"}]).decode(),
+                    "asks": orjson.dumps([{"price": "0.62", "size": "75"}]).decode(),
+                },
+                {
+                    "timestamp_received": _ts(1_000),
+                    "timestamp": _ts(1_000),
+                    "market": _market_bytes(),
+                    "event_type": "price_change",
+                    "asset_id": asset_id,
+                    "price": Decimal("0.41"),
+                    "size": Decimal("3"),
+                    "side": "BUY",
+                },
+                {
+                    "timestamp_received": _ts(1_000),
+                    "timestamp": _ts(1_000),
+                    "market": _market_bytes(),
+                    "event_type": "last_trade_price",
+                    "asset_id": asset_id,
+                    "price": Decimal("0.42"),
+                    "size": Decimal("2"),
+                    "side": "SELL",
+                },
+            ]
+        ),
+        1: _make_pmxt_payload(
+            [
+                {
+                    "timestamp_received": _ts(1_000),
+                    "timestamp": _ts(1_000),
+                    "market": _market_bytes(),
+                    "event_type": "book",
+                    "asset_id": asset_id,
+                    "bids": orjson.dumps([{"price": "0.51", "size": "100"}]).decode(),
+                    "asks": orjson.dumps([{"price": "0.52", "size": "75"}]).decode(),
+                },
+                {
+                    "timestamp_received": _ts(1_500),
+                    "timestamp": _ts(1_500),
+                    "market": _market_bytes(),
+                    "event_type": "last_trade_price",
+                    "asset_id": asset_id,
+                    "price": Decimal("0.52"),
+                    "size": Decimal("1"),
+                    "side": "BUY",
+                },
+            ]
+        ),
+    }
+
+    def fake_fetch(_s3_store, _date: str, hour: int) -> bytes:
+        return payloads.get(hour, empty_payload)
+
+    monkeypatch.setattr(canonical_module, "_fetch_pmxt_payload", fake_fetch)
+
+    stats = PMSliceStats()
+    out_path = tmp_path / "data.parquet"
+    rows_out = _slice_pmxt_for_date(
+        s3_store=object(),  # type: ignore[arg-type]
+        date="2026-04-17",
+        asset_to_instrument={asset_id: "btc-updown-5m-1:Up"},
+        asset_ids=[asset_id],
+        depth=5,
+        stats=stats,
+        data_parquet_path=out_path,
+    )
+
+    assert rows_out == 5
+    assert stats.rows_in == 5
+    assert stats.rows_out == 5
+
+    table = pq.read_table(out_path)
+    assert table.schema.names == DATA_PARQUET_SCHEMA.names
+    for actual, expected in zip(table.schema, DATA_PARQUET_SCHEMA):
+        assert actual.type == expected.type
+
+    rows = table.to_pylist()
+    assert [row["ts_ms"] for row in rows] == [1_000, 1_000, 1_000, 1_500, 2_000]
+    assert [row["kind"] for row in rows] == [
+        "delta_batch",
+        "trade",
+        "l2_snapshot",
+        "trade",
+        "l2_snapshot",
+    ]
+    assert rows[1]["px"] == 0.42
+    assert rows[2]["bids"][0]["px"] == 0.51
+    assert rows[3]["px"] == 0.52
+    assert rows[4]["bids"][0]["px"] == 0.61
 
 
 def test_build_schedule_table_groups_by_slug() -> None:

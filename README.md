@@ -268,9 +268,11 @@ Contract lifecycle events are emitted at replay time from `schedule.parquet`:
 
 ### Consumer Ordering
 
-Canonical rows carry `ts_ms` and `kind`; consumers should use those fields when
-they need to merge or order events. The current raw-to-slice pipeline no longer
-writes a normalized intermediate dataset or `source_line_number` columns.
+Canonical `data.parquet` files are physically ordered by nondecreasing `ts_ms`.
+Within a single millisecond, builders keep a deterministic source-order
+tie-breaker, but that should not be treated as sub-millisecond causality. The
+current raw-to-slice pipeline no longer writes a normalized intermediate dataset
+or `source_line_number` columns.
 
 ## CLI And Operational Flow
 
