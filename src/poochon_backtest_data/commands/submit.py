@@ -1,3 +1,5 @@
+"""`submit <venue>` — start a Step Functions execution for the new state machines."""
+
 from __future__ import annotations
 
 from argparse import Namespace
@@ -9,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..models import MarketType, OutcomesMode
+from ..models import MarketType, PolymarketTargetKind
 from ..settings import get_settings
 from ..storage import boto3_session
 
@@ -20,83 +22,159 @@ def register(subparsers) -> None:
     parser = subparsers.add_parser(name, help="Start a Step Functions execution")
     submit_subparsers = parser.add_subparsers(dest="venue", required=True)
 
-    hl = submit_subparsers.add_parser("hyperliquid")
-    hl.add_argument(
-        "--market-type",
-        choices=[MarketType.PERP.value, MarketType.SPOT.value],
-        required=True,
-    )
-    hl.add_argument("--instrument", required=True)
-    hl.add_argument("--start-date", required=True)
-    hl.add_argument("--end-date", required=True)
-    hl.add_argument("--depth", type=int, default=20)
-    hl.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
-    hl.add_argument("--state-machine-arn", default=None,
-                    help="Override auto-discovery of the state machine ARN")
-
     pm = submit_subparsers.add_parser("polymarket")
-    pm.add_argument("--series", required=True)
-    pm.add_argument("--start-date", required=True)
-    pm.add_argument("--end-date", required=True)
-    pm.add_argument(
-        "--outcomes",
-        choices=[item.value for item in OutcomesMode],
-        default=OutcomesMode.BOTH.value,
-    )
-    pm.add_argument("--depth", type=int, default=5)
-    pm.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev"))
-    pm.add_argument("--state-machine-arn", default=None)
+    pm_stage = pm.add_subparsers(dest="stage", required=True)
+    for stage_name, output_key in (
+        ("mirror", "pm_mirror_state_machine_arn"),
+        ("slice", "pm_slice_state_machine_arn"),
+    ):
+        s = pm_stage.add_parser(stage_name)
+        s.add_argument("--start-date")
+        s.add_argument("--end-date")
+        s.add_argument("--start-offset-days", type=int)
+        s.add_argument("--end-offset-days", type=int)
+        s.add_argument("--date")
+        if stage_name == "slice":
+            s.add_argument("--target", required=True, help="series:KEY or slug:KEY")
+        s.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"))
+        s.add_argument("--state-machine-arn", default=None)
+        s.set_defaults(_pulumi_output_key=output_key)
+
+    hl = submit_subparsers.add_parser("hyperliquid")
+    hl_stage = hl.add_subparsers(dest="stage", required=True)
+    for stage_name, output_key in (
+        ("mirror", "hl_mirror_state_machine_arn"),
+        ("slice", "hl_slice_state_machine_arn"),
+    ):
+        s = hl_stage.add_parser(stage_name)
+        s.add_argument("--start-date")
+        s.add_argument("--end-date")
+        s.add_argument("--start-offset-days", type=int)
+        s.add_argument("--end-offset-days", type=int)
+        s.add_argument("--date")
+        s.add_argument("--instrument", required=True)
+        s.add_argument(
+            "--market-type",
+            choices=[MarketType.PERP.value, MarketType.SPOT.value],
+            default=None,
+        )
+        if stage_name == "slice":
+            s.add_argument("--depth", type=int, default=20)
+        s.add_argument("--stack", default=os.environ.get("POOCHON_PULUMI_STACK", "dev-east"))
+        s.add_argument("--state-machine-arn", default=None)
+        s.set_defaults(_pulumi_output_key=output_key)
 
 
 def handle(args: Namespace) -> int:
-    if args.venue == "hyperliquid":
-        return _submit(
-            args,
-            payload={
-                "venue": "hyperliquid",
-                "market_type": args.market_type,
-                "instrument": args.instrument,
-                "start_date": args.start_date,
-                "end_date": args.end_date,
-                "depth": args.depth,
-            },
-            execution_slug=f"hl-{args.instrument}-{args.start_date}-{args.end_date}",
-        )
+    payload = _build_payload(args)
+    slug = _execution_slug(args)
+    return _submit(args, payload=payload, execution_slug=slug)
+
+
+def _build_payload(args: Namespace) -> dict:
+    """Build SFN input payload. State machines only support offset-days, so
+    absolute dates are converted at submit time relative to today (UTC)."""
+    from datetime import UTC, date as date_cls, datetime
+
+    payload: dict = {}
+    today = datetime.now(tz=UTC).date()
+
+    def _absolute_to_offsets(start_date: str, end_date: str) -> tuple[int, int]:
+        start = date_cls.fromisoformat(start_date)
+        end = date_cls.fromisoformat(end_date)
+        return (start - today).days, (end - today).days
+
+    if args.start_date and args.end_date:
+        start_off, end_off = _absolute_to_offsets(args.start_date, args.end_date)
+        payload["start_offset_days"] = start_off
+        payload["end_offset_days"] = end_off
+    elif args.start_offset_days is not None and args.end_offset_days is not None:
+        payload["start_offset_days"] = args.start_offset_days
+        payload["end_offset_days"] = args.end_offset_days
+    elif args.date:
+        if args.date == "yesterday":
+            payload["start_offset_days"] = -1
+            payload["end_offset_days"] = -1
+        elif args.date == "today":
+            payload["start_offset_days"] = 0
+            payload["end_offset_days"] = 0
+        else:
+            start_off, end_off = _absolute_to_offsets(args.date, args.date)
+            payload["start_offset_days"] = start_off
+            payload["end_offset_days"] = end_off
+    else:
+        raise SystemExit("specify a date window")
+
     if args.venue == "polymarket":
-        return _submit(
-            args,
-            payload={
-                "venue": "polymarket",
-                "series": args.series,
-                "start_date": args.start_date,
-                "end_date": args.end_date,
-                "outcomes": args.outcomes,
-                "depth": args.depth,
-            },
-            execution_slug=f"pm-{args.series}-{args.start_date}-{args.end_date}",
-        )
-    raise RuntimeError(f"unsupported venue: {args.venue}")
+        if args.stage == "slice":
+            # Validate the target shape; the SFN command_template references $.target as a single string.
+            kind_raw, _, key = args.target.partition(":")
+            PolymarketTargetKind(kind_raw)  # validates
+            if not key:
+                raise SystemExit("--target must be 'series:KEY' or 'slug:KEY'")
+            payload["target"] = args.target
+    else:
+        instrument = args.instrument
+        market_type = args.market_type
+        if "/" in instrument and market_type is None:
+            instrument, market_type = instrument.split("/", 1)
+        if market_type is None:
+            raise SystemExit("hyperliquid commands require --market-type or 'INSTRUMENT/MARKET_TYPE' shorthand")
+        payload["instrument"] = instrument
+        payload["market_type"] = MarketType(market_type).value
+        if args.stage == "slice":
+            payload["depth"] = args.depth
+    return payload
 
 
-def resolve_state_machine_arn(stack: str, explicit: str | None = None) -> str:
+def _execution_slug(args: Namespace) -> str:
+    pieces: list[str] = [args.venue, args.stage]
+    if args.venue == "polymarket" and args.stage == "slice":
+        pieces.append(args.target.replace(":", "-"))
+    elif args.venue == "hyperliquid":
+        instrument = args.instrument
+        market_type = args.market_type
+        if "/" in instrument and market_type is None:
+            instrument, market_type = instrument.split("/", 1)
+        pieces.append(f"{market_type}-{instrument}")
+    if args.start_date:
+        pieces.append(args.start_date)
+    elif args.date:
+        pieces.append(args.date)
+    return "-".join(pieces)
+
+
+def resolve_state_machine_arn(args_or_stack, output_key: str | None = None, explicit: str | None = None) -> str:
+    """Resolve a state machine ARN.
+
+    Two calling shapes for compatibility:
+      - resolve_state_machine_arn(args)        — uses args._pulumi_output_key + args.stack + args.state_machine_arn
+      - resolve_state_machine_arn(stack, output_key, explicit) — by-name lookup
+    """
+    if isinstance(args_or_stack, Namespace):
+        args = args_or_stack
+        output_key = args._pulumi_output_key
+        explicit = args.state_machine_arn
+        stack = args.stack
+    else:
+        stack = args_or_stack
     if explicit:
         return explicit
-    env_arn = os.environ.get("POOCHON_INGESTION_STATE_MACHINE_ARN")
-    if env_arn:
-        return env_arn
-    return _pulumi_output(stack, "ingestion_state_machine_arn")
+    settings = get_settings()
+    settings_attr = getattr(settings, output_key, None)
+    if settings_attr:
+        return settings_attr
+    return _pulumi_output(stack, output_key)
 
 
 def _pulumi_output(stack: str, output_name: str) -> str:
-    write_dir = _find_stack_dir(["write", "runtime"])
-    if write_dir is None:
-        raise RuntimeError(
-            "cannot locate infra/write or infra/runtime; set --state-machine-arn or POOCHON_INGESTION_STATE_MACHINE_ARN"
-        )
+    runtime_dir = _find_stack_dir(["runtime"])
+    if runtime_dir is None:
+        raise RuntimeError("cannot locate infra/runtime; set --state-machine-arn")
     try:
         result = subprocess.run(
             ["pulumi", "stack", "output", output_name, "--stack", stack],
-            cwd=write_dir,
+            cwd=runtime_dir,
             capture_output=True,
             text=True,
             timeout=30,
@@ -147,14 +225,13 @@ _NAME_SAFE_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 def _execution_name(slug: str) -> str:
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     sanitized = _NAME_SAFE_CHARS.sub("-", slug).strip("-")
-    # Step Functions execution names have an 80-char cap.
     body = f"{sanitized[:50]}-{timestamp}"
     return body[:80]
 
 
 def _submit(args: Namespace, *, payload: dict, execution_slug: str) -> int:
     try:
-        state_machine_arn = resolve_state_machine_arn(args.stack, args.state_machine_arn)
+        state_machine_arn = resolve_state_machine_arn(args)
     except RuntimeError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

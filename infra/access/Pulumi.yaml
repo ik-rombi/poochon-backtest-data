@@ -1,0 +1,4 @@
+name: poochon-backtest-data-access
+runtime:
+  name: python
+description: Cross-account read broker for Poochon backtest data catalog and canonical shard downloads

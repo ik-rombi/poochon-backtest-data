@@ -1,306 +1,344 @@
+"""`run <venue> mirror|slice|all` — local pipeline execution.
+
+Stage handlers wire up the underlying mirror + slice functions. The slice
+handlers will raise NotImplementedError until Phases 3 (PM) and 4 (HL) land.
+"""
+
 from __future__ import annotations
 
 from argparse import Namespace
 import logging
+import sys
 
-from ..canonical import (
-    build_hyperliquid_canonical_day,
-    build_polymarket_canonical_day_from_storage,
-)
-from ..hyperliquid import backfill_day, normalize_day, sync_window
 from ..models import (
-    IngestionRequest,
-    MarketRef,
+    HyperliquidIngestionRequest,
     MarketType,
-    OutcomesMode,
-    PolymarketSeriesSyncRequest,
-    Venue,
-    iter_dates_inclusive,
+    PolymarketMirrorRequest,
+    PolymarketSliceRequest,
+    PolymarketTargetKind,
 )
-from ..models import polymarket_metadata_s3_key
-from ..polymarket_telonex import (
-    _clip_resolution_to_window,
-    backfill_market,
-    discover_series_markets,
-    normalize_market,
-    sync_series,
-)
-from ..storage import CanonicalShardRepository, S3Store
-from ._session import open_session, require_telonex_api_key
 
 logger = logging.getLogger(__name__)
-
 name = "run"
 
 
-def _add_common_hyperliquid_args(parser) -> None:
+def _add_window_args(parser) -> None:
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
+    parser.add_argument("--start-offset-days", type=int)
+    parser.add_argument("--end-offset-days", type=int)
     parser.add_argument(
-        "--market-type",
-        choices=[MarketType.PERP.value, MarketType.SPOT.value],
-        required=True,
+        "--date",
+        help="Shorthand for a single-day window: YYYY-MM-DD, 'today', or 'yesterday'.",
     )
-    parser.add_argument("--instrument", required=True)
-    parser.add_argument("--start-date", required=True)
-    parser.add_argument("--end-date", required=True)
-    parser.add_argument("--depth", type=int, default=20)
 
 
-def _add_common_polymarket_args(parser) -> None:
-    parser.add_argument("--series", required=True)
-    parser.add_argument("--start-date", required=True)
-    parser.add_argument("--end-date", required=True)
-    parser.add_argument(
-        "--outcomes",
-        choices=[item.value for item in OutcomesMode],
-        default=OutcomesMode.BOTH.value,
-    )
-    parser.add_argument("--depth", type=int, default=5)
+def _add_force(parser) -> None:
+    parser.add_argument("--force", action="store_true")
 
 
 def register(subparsers) -> None:
     parser = subparsers.add_parser(name, help="Execute a pipeline stage locally")
     run_subparsers = parser.add_subparsers(dest="venue", required=True)
 
-    hl = run_subparsers.add_parser("hyperliquid", help="Hyperliquid stages")
-    hl_stage = hl.add_subparsers(dest="stage", required=True)
-
-    for stage in ("raw", "normalize", "canonical", "all"):
-        stage_parser = hl_stage.add_parser(stage)
-        _add_common_hyperliquid_args(stage_parser)
-        if stage in {"canonical", "all"}:
-            stage_parser.add_argument("--force", action="store_true")
-
     pm = run_subparsers.add_parser("polymarket", help="Polymarket stages")
     pm_stage = pm.add_subparsers(dest="stage", required=True)
 
-    for stage in ("discover", "raw", "normalize", "canonical", "all"):
-        stage_parser = pm_stage.add_parser(stage)
-        _add_common_polymarket_args(stage_parser)
-        if stage in {"canonical", "all"}:
-            stage_parser.add_argument("--force", action="store_true")
+    pm_mirror = pm_stage.add_parser("mirror", help="Mirror PMXT raw firehose for the window")
+    _add_window_args(pm_mirror)
+
+    pm_slice = pm_stage.add_parser("slice", help="Build canonical slices for a target")
+    _add_window_args(pm_slice)
+    pm_slice.add_argument(
+        "--target",
+        required=True,
+        help="series:KEY or slug:KEY",
+    )
+    _add_force(pm_slice)
+
+    pm_all = pm_stage.add_parser("all", help="Mirror + slice in one command")
+    _add_window_args(pm_all)
+    pm_all.add_argument("--target", required=True)
+    _add_force(pm_all)
+
+    hl = run_subparsers.add_parser("hyperliquid", help="Hyperliquid stages")
+    hl_stage = hl.add_subparsers(dest="stage", required=True)
+
+    hl_mirror = hl_stage.add_parser("mirror", help="Mirror HL raw archive for the window")
+    _add_window_args(hl_mirror)
+    hl_mirror.add_argument(
+        "--instrument",
+        required=True,
+        help="Either 'BTC/perp' or '--instrument BTC --market-type perp'",
+    )
+    hl_mirror.add_argument(
+        "--market-type",
+        choices=[MarketType.PERP.value, MarketType.SPOT.value],
+        default=None,
+    )
+
+    hl_slice = hl_stage.add_parser("slice", help="Build canonical slices for an instrument")
+    _add_window_args(hl_slice)
+    hl_slice.add_argument("--instrument", required=True)
+    hl_slice.add_argument(
+        "--market-type",
+        choices=[MarketType.PERP.value, MarketType.SPOT.value],
+        default=None,
+    )
+    hl_slice.add_argument("--depth", type=int, default=20)
+    _add_force(hl_slice)
+
+    hl_all = hl_stage.add_parser("all", help="Mirror + slice in one command")
+    _add_window_args(hl_all)
+    hl_all.add_argument("--instrument", required=True)
+    hl_all.add_argument(
+        "--market-type",
+        choices=[MarketType.PERP.value, MarketType.SPOT.value],
+        default=None,
+    )
+    hl_all.add_argument("--depth", type=int, default=20)
+    _add_force(hl_all)
 
 
 def handle(args: Namespace) -> int:
-    if args.venue == "hyperliquid":
-        return _handle_hyperliquid(args)
     if args.venue == "polymarket":
         return _handle_polymarket(args)
+    if args.venue == "hyperliquid":
+        return _handle_hyperliquid(args)
     raise RuntimeError(f"unsupported venue: {args.venue}")
 
 
-def _hyperliquid_market(args: Namespace) -> MarketRef:
-    return MarketRef(
-        venue=Venue.HYPERLIQUID,
-        market_type=args.market_type,
-        instrument=args.instrument,
-    )
+def _resolve_window_args(args: Namespace) -> dict:
+    """Map argparse window flags to WindowSpec kwargs.
+
+    `--date` is sugar that sets start_date == end_date (or, for relative aliases,
+    start_offset_days == end_offset_days).
+    """
+    if args.date is not None:
+        if args.start_date or args.end_date or args.start_offset_days is not None or args.end_offset_days is not None:
+            raise SystemExit("--date is incompatible with --start-date/--end-date/--*-offset-days")
+        if args.date == "yesterday":
+            return {"start_offset_days": -1, "end_offset_days": -1}
+        if args.date == "today":
+            return {"start_offset_days": 0, "end_offset_days": 0}
+        return {"start_date": args.date, "end_date": args.date}
+
+    if args.start_date or args.end_date:
+        if not args.start_date or not args.end_date:
+            raise SystemExit("provide both --start-date and --end-date")
+        return {"start_date": args.start_date, "end_date": args.end_date}
+
+    if args.start_offset_days is not None or args.end_offset_days is not None:
+        if args.start_offset_days is None or args.end_offset_days is None:
+            raise SystemExit("provide both --start-offset-days and --end-offset-days")
+        return {
+            "start_offset_days": args.start_offset_days,
+            "end_offset_days": args.end_offset_days,
+        }
+
+    raise SystemExit("specify a date window (--date, --start-date/--end-date, or offsets)")
 
 
-def _handle_hyperliquid(args: Namespace) -> int:
-    bundle = open_session()
-    market = _hyperliquid_market(args)
-    dates = iter_dates_inclusive(args.start_date, args.end_date)
-
-    if args.stage == "all":
-        sync_window(
-            bundle.s3_store,
-            bundle.coverage_repo,
-            bundle.shard_repo,
-            request=IngestionRequest(
-                market_type=args.market_type,
-                instrument=args.instrument,
-                start_date=args.start_date,
-                end_date=args.end_date,
-            ),
-            request_payer=bundle.settings.request_payer,
-            depth=args.depth,
-        )
-        return 0
-
-    if args.stage == "raw":
-        for date in dates:
-            logger.info("hyperliquid raw date=%s instrument=%s", date, args.instrument)
-            backfill_day(
-                bundle.s3_store,
-                bundle.coverage_repo,
-                market=market,
-                date=date,
-                request_payer=bundle.settings.request_payer,
-            )
-        return 0
-
-    if args.stage == "normalize":
-        for date in dates:
-            logger.info("hyperliquid normalize date=%s instrument=%s", date, args.instrument)
-            normalize_day(
-                bundle.s3_store,
-                bundle.coverage_repo,
-                market=market,
-                date=date,
-            )
-        return 0
-
-    if args.stage == "canonical":
-        for date in dates:
-            logger.info(
-                "hyperliquid canonical date=%s instrument=%s depth=%s force=%s",
-                date,
-                args.instrument,
-                args.depth,
-                args.force,
-            )
-            build_hyperliquid_canonical_day(
-                market=market,
-                date=date,
-                depth=args.depth,
-                s3_store=bundle.s3_store,
-                coverage_repo=bundle.coverage_repo,
-                shard_repo=bundle.shard_repo,
-                force=args.force,
-            )
-        return 0
-
-    raise RuntimeError(f"unsupported stage: {args.stage}")
+def _parse_target(raw: str) -> tuple[PolymarketTargetKind, str]:
+    if ":" not in raw:
+        raise SystemExit("--target must be 'series:KEY' or 'slug:KEY'")
+    kind_raw, key = raw.split(":", 1)
+    try:
+        kind = PolymarketTargetKind(kind_raw)
+    except ValueError as error:
+        raise SystemExit(
+            f"unsupported target_kind '{kind_raw}'; expected 'series' or 'slug'"
+        ) from error
+    if not key.strip():
+        raise SystemExit("target_key is empty")
+    return kind, key
 
 
-def _polymarket_request(args: Namespace) -> PolymarketSeriesSyncRequest:
-    return PolymarketSeriesSyncRequest(
-        series=args.series,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        outcomes=args.outcomes,
-        depth=args.depth,
-    )
-
-
-def _discovered_resolutions(args: Namespace, *, client=None):
-    request = _polymarket_request(args)
-    discovered = discover_series_markets(request, client=client)
-    resolutions = []
-    for resolution in discovered:
-        clipped = _clip_resolution_to_window(
-            resolution,
-            start_date=request.start_date,
-            end_date=request.end_date,
-        )
-        if clipped is not None:
-            resolutions.append(clipped)
-    if not resolutions:
-        raise ValueError(
-            f"no polymarket markets were discovered for series={request.series} "
-            f"between {request.start_date} and {request.end_date}"
-        )
-    return resolutions
+def _parse_hl_market(args: Namespace) -> tuple[str, MarketType]:
+    instrument = args.instrument
+    market_type_raw = args.market_type
+    if "/" in instrument and market_type_raw is None:
+        instrument, market_type_raw = instrument.split("/", 1)
+    if market_type_raw is None:
+        raise SystemExit("hyperliquid commands require --market-type or 'INSTRUMENT/MARKET_TYPE' shorthand")
+    return instrument, MarketType(market_type_raw)
 
 
 def _handle_polymarket(args: Namespace) -> int:
-    bundle = open_session()
-
+    window_kwargs = _resolve_window_args(args)
+    if args.stage == "mirror":
+        request = PolymarketMirrorRequest(**window_kwargs)
+        return _run_pm_mirror(request)
+    target_kind, target_key = _parse_target(args.target)
+    if args.stage == "slice":
+        request = PolymarketSliceRequest(
+            target_kind=target_kind, target_key=target_key, **window_kwargs
+        )
+        return _run_pm_slice(request, force=args.force)
     if args.stage == "all":
-        sync_series(
-            bundle.s3_store,
-            bundle.coverage_repo,
-            bundle.shard_repo,
-            request=_polymarket_request(args),
-            telonex_api_key=require_telonex_api_key(),
+        mirror_request = PolymarketMirrorRequest(**window_kwargs)
+        slice_request = PolymarketSliceRequest(
+            target_kind=target_kind, target_key=target_key, **window_kwargs
         )
-        return 0
+        rc = _run_pm_mirror(mirror_request)
+        if rc != 0:
+            return rc
+        return _run_pm_slice(slice_request, force=args.force)
+    raise RuntimeError(f"unsupported polymarket stage: {args.stage}")
 
-    if args.stage == "discover":
-        resolutions = _discovered_resolutions(args)
-        for resolution in resolutions:
-            bundle.s3_store.put_json(
-                polymarket_metadata_s3_key(resolution),
-                resolution.model_dump(mode="json"),
-            )
-        logger.info(
-            "polymarket discover series=%s resolutions=%d",
-            args.series,
-            len(resolutions),
+
+def _handle_hyperliquid(args: Namespace) -> int:
+    instrument, market_type = _parse_hl_market(args)
+    window_kwargs = _resolve_window_args(args)
+    if args.stage == "mirror":
+        request = HyperliquidIngestionRequest(
+            instrument=instrument, market_type=market_type, **window_kwargs
         )
-        return 0
+        return _run_hl_mirror(request)
+    if args.stage == "slice":
+        request = HyperliquidIngestionRequest(
+            instrument=instrument, market_type=market_type, **window_kwargs
+        )
+        return _run_hl_slice(request, depth=args.depth, force=args.force)
+    if args.stage == "all":
+        request = HyperliquidIngestionRequest(
+            instrument=instrument, market_type=market_type, **window_kwargs
+        )
+        rc = _run_hl_mirror(request)
+        if rc != 0:
+            return rc
+        return _run_hl_slice(request, depth=args.depth, force=args.force)
+    raise RuntimeError(f"unsupported hyperliquid stage: {args.stage}")
 
-    if args.stage == "canonical":
-        for date in iter_dates_inclusive(args.start_date, args.end_date):
-            logger.info(
-                "polymarket canonical date=%s series=%s outcomes=%s depth=%s force=%s",
-                date,
-                args.series,
-                args.outcomes,
-                args.depth,
-                args.force,
-            )
-            build_polymarket_canonical_day_from_storage(
-                date=date,
-                series_key=args.series,
-                outcomes=OutcomesMode(args.outcomes),
-                depth=args.depth,
-                s3_store=bundle.s3_store,
-                shard_repo=bundle.shard_repo,
-                force=args.force,
-            )
-        return 0
 
-    # raw and normalize both need discovered resolutions first
-    resolutions = _discovered_resolutions(args)
-    telonex_api_key = require_telonex_api_key() if args.stage == "raw" else None
+def _run_pm_mirror(request: PolymarketMirrorRequest) -> int:
+    from ._session import open_session
+    from ..pmxt import mirror_pmxt_window
 
-    if args.stage not in {"raw", "normalize"}:
-        raise RuntimeError(f"unsupported stage: {args.stage}")
+    bundle = open_session()
+    start_date, end_date = request.resolve_window()
+    logger.info("pm mirror start  window=%s..%s", start_date, end_date)
+    summary = mirror_pmxt_window(
+        s3_store=bundle.s3_store,
+        coverage_repo=bundle.coverage_repo,
+        start_date=start_date,
+        end_date=end_date,
+        pmxt_base_url=bundle.settings.pmxt_base_url,
+    )
+    logger.info(
+        "pm mirror done   mirrored=%d skipped=%d failed=%d bytes=%d",
+        summary.mirrored,
+        summary.skipped,
+        summary.failed,
+        summary.bytes_total,
+    )
+    return 0 if summary.failed == 0 else 2
 
-    # Mirror sync_series: per-thread clones of S3 + coverage to avoid
-    # boto3 client sharing across threads.
-    from threading import local as _local
-    worker_state = _local()
 
-    def process(resolution):
-        if not hasattr(worker_state, "store"):
-            worker_state.store = bundle.s3_store.clone() if hasattr(bundle.s3_store, "clone") else bundle.s3_store
-            worker_state.coverage = bundle.coverage_repo.clone() if hasattr(bundle.coverage_repo, "clone") else bundle.coverage_repo
+def _run_pm_slice(request: PolymarketSliceRequest, *, force: bool) -> int:
+    from ._session import open_session
+    from ..canonical import build_pm_slice
+
+    bundle = open_session()
+    target = request.target()
+    start_date, end_date = request.resolve_window()
+    logger.info(
+        "pm slice start  target=%s:%s window=%s..%s force=%s",
+        target.target_kind.value,
+        target.target_key,
+        start_date,
+        end_date,
+        force,
+    )
+    rc = 0
+    for date in request.iter_dates():
         try:
-            if args.stage == "raw":
-                logger.info(
-                    "polymarket raw series=%s market_id=%s outcome=%s",
-                    args.series, resolution.market_id, resolution.outcome,
-                )
-                backfill_market(
-                    worker_state.store,
-                    worker_state.coverage,
-                    resolution=resolution,
-                    telonex_api_key=telonex_api_key,
-                )
-            else:
-                logger.info(
-                    "polymarket normalize series=%s market_id=%s outcome=%s",
-                    args.series, resolution.market_id, resolution.outcome,
-                )
-                normalize_market(
-                    worker_state.store,
-                    worker_state.coverage,
-                    resolution=resolution,
-                )
-            return None
-        except Exception as error:
-            return {
-                "market_id": resolution.market_id,
-                "outcome": resolution.outcome,
-                "error": f"{type(error).__name__}: {error}",
-            }
+            build_pm_slice(
+                target=target,
+                date=date,
+                s3_store=bundle.s3_store,
+                coverage_repo=bundle.coverage_repo,
+                shard_repo=bundle.shard_repo,
+                gamma_base_url=bundle.settings.gamma_base_url,
+                vatic_base_url=bundle.settings.vatic_base_url,
+                binance_base_url=bundle.settings.binance_base_url,
+                binance_us_base_url=bundle.settings.binance_us_base_url,
+                force=force,
+            )
+        except NotImplementedError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        except Exception as error:  # noqa: BLE001
+            logger.exception("pm slice failed date=%s: %s", date, error)
+            rc = 2
+    return rc
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-    max_workers = min(8, len(resolutions)) or 1
-    failures: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process, r) for r in resolutions]
-        for future in _as_completed(futures):
-            result = future.result()
-            if result is not None:
-                failures.append(result)
+def _run_hl_mirror(request: HyperliquidIngestionRequest) -> int:
+    from ._session import open_session
+    from ..hyperliquid import mirror_hl_window
 
-    if failures:
-        logger.warning(
-            "polymarket %s stage finished with %d failures (of %d); first: %s",
-            args.stage, len(failures), len(resolutions), failures[0],
-        )
-    return 0
+    bundle = open_session()
+    market = request.market_ref()
+    start_date, end_date = request.resolve_window()
+    logger.info(
+        "hl mirror start market=%s/%s window=%s..%s",
+        market.market_type.value,
+        market.instrument,
+        start_date,
+        end_date,
+    )
+    summary = mirror_hl_window(
+        market=market,
+        start_date=start_date,
+        end_date=end_date,
+        s3_store=bundle.s3_store,
+        coverage_repo=bundle.coverage_repo,
+        request_payer=bundle.settings.request_payer,
+    )
+    logger.info(
+        "hl mirror done l2_mirrored=%d l2_skipped=%d l2_failed=%d "
+        "fills_mirrored=%d fills_skipped=%d fills_failed=%d bytes=%d",
+        summary.l2_mirrored,
+        summary.l2_skipped,
+        summary.l2_failed,
+        summary.fills_mirrored,
+        summary.fills_skipped,
+        summary.fills_failed,
+        summary.bytes_total,
+    )
+    return 0 if summary.l2_failed == 0 and summary.fills_failed == 0 else 2
+
+
+def _run_hl_slice(request: HyperliquidIngestionRequest, *, depth: int, force: bool) -> int:
+    from ._session import open_session
+    from ..canonical import build_hl_slice
+
+    bundle = open_session()
+    market = request.market_ref()
+    start_date, end_date = request.resolve_window()
+    logger.info(
+        "hl slice start market=%s/%s window=%s..%s depth=%d force=%s",
+        market.market_type.value,
+        market.instrument,
+        start_date,
+        end_date,
+        depth,
+        force,
+    )
+    rc = 0
+    for date in request.iter_dates():
+        try:
+            build_hl_slice(
+                market=market,
+                date=date,
+                s3_store=bundle.s3_store,
+                coverage_repo=bundle.coverage_repo,
+                shard_repo=bundle.shard_repo,
+                depth=depth,
+                force=force,
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.exception("hl slice failed date=%s: %s", date, error)
+            rc = 2
+    return rc

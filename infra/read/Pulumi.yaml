@@ -1,4 +1,0 @@
-name: poochon-backtest-data-read
-runtime:
-  name: python
-description: Consumer-facing read API (FastAPI on ECS + ALB). Destroy to stop paying for ALB/api when idle.

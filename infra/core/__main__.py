@@ -7,11 +7,23 @@ import pulumi_aws as aws
 stack = pulumi.get_stack()
 config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
+expected_aws_account_id = config.require("expectedAwsAccountId")
 
 caller = aws.get_caller_identity_output()
 region = aws.get_region_output()
 
-bucket_name = pulumi.Output.all(caller.account_id, region.name).apply(
+def require_expected_account(account_id: str) -> str:
+    if account_id != expected_aws_account_id:
+        raise ValueError(
+            f"refusing to deploy to AWS account {account_id}; "
+            f"expected {expected_aws_account_id}"
+        )
+    return account_id
+
+
+aws_account_id = caller.account_id.apply(require_expected_account)
+
+bucket_name = pulumi.Output.all(aws_account_id, region.name).apply(
     lambda args: f"{prefix}-{args[0]}-{args[1]}-{stack}"
 )
 
@@ -40,16 +52,10 @@ coverage_table = aws.dynamodb.Table(
     tags={"Project": "poochon-backtest-data", "Stack": stack},
 )
 
-replay_table = aws.dynamodb.Table(
-    "replay-table",
-    name=f"{prefix}-replays-{stack}",
-    billing_mode="PAY_PER_REQUEST",
-    hash_key="replay_id",
-    attributes=[aws.dynamodb.TableAttributeArgs(name="replay_id", type="S")],
-    tags={"Project": "poochon-backtest-data", "Stack": stack},
-)
-
-replay_shard_table = aws.dynamodb.Table(
+# Shard table keeps its legacy AWS name (`replay-shards-...`) to avoid recreating
+# the table and losing existing shard records. Logical Pulumi name and exports
+# both use the simpler `shard_table` term to match the new code.
+shard_table = aws.dynamodb.Table(
     "replay-shard-table",
     name=f"{prefix}-replay-shards-{stack}",
     billing_mode="PAY_PER_REQUEST",
@@ -60,5 +66,5 @@ replay_shard_table = aws.dynamodb.Table(
 
 pulumi.export("data_bucket_name", data_bucket.bucket)
 pulumi.export("coverage_table_name", coverage_table.name)
-pulumi.export("replay_table_name", replay_table.name)
-pulumi.export("replay_shard_table_name", replay_shard_table.name)
+pulumi.export("shard_table_name", shard_table.name)
+pulumi.export("aws_account_id", aws_account_id)

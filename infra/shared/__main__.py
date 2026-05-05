@@ -12,15 +12,28 @@ stack = pulumi.get_stack()
 config = pulumi.Config()
 prefix = config.get("namePrefix") or "poochon-backtest-data"
 core_stack_ref = config.require("coreStackRef")
+expected_aws_account_id = config.require("expectedAwsAccountId")
 
 core = pulumi.StackReference(core_stack_ref)
 bucket_name = core.require_output("data_bucket_name")
 coverage_table_name = core.require_output("coverage_table_name")
-replay_shard_table_name = core.require_output("replay_shard_table_name")
+shard_table_name = core.require_output("shard_table_name")
 
 region = aws.get_region_output()
 caller = aws.get_caller_identity_output()
 availability_zones = aws.get_availability_zones(state="available")
+
+
+def require_expected_account(account_id: str) -> str:
+    if account_id != expected_aws_account_id:
+        raise ValueError(
+            f"refusing to deploy to AWS account {account_id}; "
+            f"expected {expected_aws_account_id}"
+        )
+    return account_id
+
+
+aws_account_id = caller.account_id.apply(require_expected_account)
 
 
 def assume_role_policy(service: str) -> str:
@@ -89,12 +102,12 @@ aws.ec2.RouteTableAssociation(
     route_table_id=route_table.id,
 )
 
-# Task SG allows ingress within the VPC on 8080 (so the ALB in infra/read can
-# reach the api service) and unrestricted egress.
+# Task SG allows ingress within the VPC on 8080 for runtime/API tasks and
+# unrestricted egress.
 task_sg = aws.ec2.SecurityGroup(
     "shared-task-sg",
     vpc_id=vpc.id,
-    description="ECS task security group (shared between sync and api tasks)",
+    description="ECS task security group (shared by runtime tasks)",
     ingress=[
         aws.ec2.SecurityGroupIngressArgs(
             protocol="tcp",
@@ -172,9 +185,9 @@ aws.iam.RolePolicy(
         bucket_arn,
         bucket_objects_arn,
         coverage_table_name,
-        replay_shard_table_name,
+        shard_table_name,
         region.name,
-        caller.account_id,
+        aws_account_id,
     ).apply(
         lambda args: json.dumps(
             {
@@ -240,3 +253,4 @@ pulumi.export("execution_role_arn", execution_role.arn)
 pulumi.export("execution_role_name", execution_role.name)
 pulumi.export("execution_role_id", execution_role.id)
 pulumi.export("task_role_arn", task_role.arn)
+pulumi.export("aws_account_id", aws_account_id)
