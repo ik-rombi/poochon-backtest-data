@@ -41,6 +41,9 @@ Current dev stack defaults:
 - shared stack: persistent (effectively — kept up because destroy cost = ECR image rebuild)
 - runtime stack: persistent scheduler/state-machine definitions with pay-per-run ECS tasks
 - access stack: persistent cross-account read role used by Poochon
+- Polymarket runtime cadence: hourly raw mirror plus daily canonical slice
+- Hyperliquid runtime cadence: monthly lagged archive refill on the 15th UTC
+  over an inclusive `-45..-15` day window, followed by monthly canonical slice
 
 ## Poochon Control-Plane Broker
 
@@ -78,9 +81,12 @@ There are two venue families today:
 - Hyperliquid
   - raw source: Hyperliquid public archive buckets
   - raw units: hourly L2 and fills archives
+  - scheduled cadence: monthly lagged refill because the public L2 archive is
+    historical/backfill data, not a near-real-time feed
   - canonical units: daily shard per instrument/date/depth
 - Polymarket
   - raw source: PMXT hourly Polymarket orderbook files
+  - scheduled cadence: hourly raw mirror and daily canonical slice
   - schedule discovery: Gamma
   - price-to-beat enrichment: Vatic first, Binance 1-minute open fallback
   - canonical units: daily shard per `series_key`/date/depth

@@ -6,13 +6,17 @@ configured via Pulumi config:
 
     poochon-backtest-data-runtime:
       pmMirrorCron:        cron(15 * * * ? *)
-      hlMirrorCron:        cron(10 * * * ? *)
+      hlMirrorCron:        cron(10 1 15 * ? *)
       pmSliceTargets:      ["series:btc-updown-5m", "slug:will-...-2026"]
       pmSliceCron:         cron(30 1 * * ? *)
       hlSliceMarkets:      ["perp:BTC", "perp:ETH"]
-      hlSliceCron:         cron(0 1 * * ? *)
+      hlSliceCron:         cron(0 2 15 * ? *)
       hlSliceDepth:        20
       mirrorBackfillDays:  2
+      hlMirrorStartOffsetDays: -45
+      hlMirrorEndOffsetDays:   -15
+      hlSliceStartOffsetDays:  -45
+      hlSliceEndOffsetDays:    -15
 
 Manual one-off invocations: `submit polymarket slice --target series:KEY ...`
 """
@@ -405,10 +409,22 @@ def _schedule(
 
 
 pm_mirror_cron = config.get("pmMirrorCron") or "cron(15 * * * ? *)"
-hl_mirror_cron = config.get("hlMirrorCron") or "cron(10 * * * ? *)"
+hl_mirror_cron = config.get("hlMirrorCron") or "cron(10 1 15 * ? *)"
 pm_slice_cron = config.get("pmSliceCron") or "cron(30 1 * * ? *)"
-hl_slice_cron = config.get("hlSliceCron") or "cron(0 1 * * ? *)"
+hl_slice_cron = config.get("hlSliceCron") or "cron(0 2 15 * ? *)"
 mirror_backfill_days = config.get_int("mirrorBackfillDays") or 2
+hl_mirror_start_offset_days = config.get_int("hlMirrorStartOffsetDays")
+if hl_mirror_start_offset_days is None:
+    hl_mirror_start_offset_days = -45
+hl_mirror_end_offset_days = config.get_int("hlMirrorEndOffsetDays")
+if hl_mirror_end_offset_days is None:
+    hl_mirror_end_offset_days = -15
+hl_slice_start_offset_days = config.get_int("hlSliceStartOffsetDays")
+if hl_slice_start_offset_days is None:
+    hl_slice_start_offset_days = -45
+hl_slice_end_offset_days = config.get_int("hlSliceEndOffsetDays")
+if hl_slice_end_offset_days is None:
+    hl_slice_end_offset_days = -15
 hl_slice_depth = config.get_int("hlSliceDepth") or 20
 
 pm_slice_targets = config.get_object("pmSliceTargets") or []
@@ -430,8 +446,8 @@ def _hl_mirror_payload(market: str) -> dict:
     return {
         "instrument": instrument,
         "market_type": market_type,
-        "start_offset_days": -mirror_backfill_days,
-        "end_offset_days": 0,
+        "start_offset_days": hl_mirror_start_offset_days,
+        "end_offset_days": hl_mirror_end_offset_days,
     }
 
 
@@ -477,8 +493,8 @@ for raw in hl_slice_markets:
             "instrument": instrument,
             "market_type": market_type,
             "depth": hl_slice_depth,
-            "start_offset_days": -1,
-            "end_offset_days": -1,
+            "start_offset_days": hl_slice_start_offset_days,
+            "end_offset_days": hl_slice_end_offset_days,
         },
     )
 
