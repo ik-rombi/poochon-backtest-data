@@ -13,12 +13,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from heapq import heappop, heappush
 import io
 import logging
 from pathlib import Path
 import tempfile
 from time import perf_counter
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable
 
 import orjson
 import pyarrow as pa
@@ -292,6 +293,8 @@ class PMSliceStats:
     asset_ids_kept: int = 0
     rows_in: int = 0
     rows_out: int = 0
+    best_bound_deletes: int = 0
+    exposed_level_inserts: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
     fetch_seconds: float = 0.0
@@ -348,42 +351,59 @@ def build_pm_slice(
     # Step 1 — pre-flight: raw_pmxt coverage for all 24 hours of `date`.
     _assert_raw_pmxt_ready(coverage_repo, s3_store, date)
 
-    # Step 2 — discover schedule.
+    # Step 2 — discover or reuse schedule.
     discover_started = perf_counter()
-    urls = GammaUrls(
-        gamma_base_url=gamma_base_url,
-        vatic_base_url=vatic_base_url,
-        binance_base_url=binance_base_url,
-        binance_us_base_url=binance_us_base_url,
-    )
-    resolutions = discover_resolutions(target, start_date=date, end_date=date, urls=urls)
-    if not resolutions:
-        raise RuntimeError(
-            f"no Polymarket resolutions discovered for target={target.target_kind.value}:"
-            f"{target.target_key} date={date}"
+    schedule_table = _load_existing_pm_schedule_table(
+        existing=existing,
+        target=target,
+        s3_store=s3_store,
+        schedule_key=schedule_key,
+    ) if force else None
+    if schedule_table is not None:
+        asset_to_instrument = _asset_to_instrument_from_schedule(schedule_table)
+        stats.contracts_discovered = schedule_table.num_rows
+        stats.asset_ids_kept = len(asset_to_instrument)
+        logger.info(
+            "pm slice reused existing schedule contracts=%d asset_ids=%d (%.2fs)",
+            stats.contracts_discovered,
+            stats.asset_ids_kept,
+            perf_counter() - discover_started,
         )
-    schedule_table = _build_schedule_table(target, resolutions)
-    if (
-        force
-        and existing is not None
-        and existing.schedule_file is not None
-        and schedule_table.num_rows < existing.schedule_file.row_count
-    ):
-        raise RuntimeError(
-            f"refusing to shrink Polymarket schedule for target={target.target_kind.value}:"
-            f"{target.target_key} date={date}: discovered {schedule_table.num_rows} "
-            f"contract rows, existing shard has {existing.schedule_file.row_count}"
+    else:
+        urls = GammaUrls(
+            gamma_base_url=gamma_base_url,
+            vatic_base_url=vatic_base_url,
+            binance_base_url=binance_base_url,
+            binance_us_base_url=binance_us_base_url,
         )
-    asset_to_instrument = {res.asset_id: res.instrument for res in resolutions}
+        resolutions = discover_resolutions(target, start_date=date, end_date=date, urls=urls)
+        if not resolutions:
+            raise RuntimeError(
+                f"no Polymarket resolutions discovered for target={target.target_kind.value}:"
+                f"{target.target_key} date={date}"
+            )
+        schedule_table = _build_schedule_table(target, resolutions)
+        if (
+            force
+            and existing is not None
+            and existing.schedule_file is not None
+            and schedule_table.num_rows < existing.schedule_file.row_count
+        ):
+            raise RuntimeError(
+                f"refusing to shrink Polymarket schedule for target={target.target_kind.value}:"
+                f"{target.target_key} date={date}: discovered {schedule_table.num_rows} "
+                f"contract rows, existing shard has {existing.schedule_file.row_count}"
+            )
+        asset_to_instrument = {res.asset_id: res.instrument for res in resolutions}
+        stats.contracts_discovered = len({res.slug for res in resolutions})
+        stats.asset_ids_kept = len(asset_to_instrument)
+        logger.info(
+            "pm slice discovered contracts=%d asset_ids=%d (%.2fs)",
+            stats.contracts_discovered,
+            stats.asset_ids_kept,
+            perf_counter() - discover_started,
+        )
     asset_ids = list(asset_to_instrument)
-    stats.contracts_discovered = len({res.slug for res in resolutions})
-    stats.asset_ids_kept = len(asset_ids)
-    logger.info(
-        "pm slice discovered contracts=%d asset_ids=%d (%.2fs)",
-        stats.contracts_discovered,
-        stats.asset_ids_kept,
-        perf_counter() - discover_started,
-    )
 
     # Step 3 — slice raw_pmxt directly to a local data.parquet (streaming).
     write_started = perf_counter()
@@ -440,7 +460,9 @@ def build_pm_slice(
 
     logger.info(
         "pm slice done target=%s:%s date=%s events=%d data_bytes=%d "
-        "rows_in=%d rows_out=%d total=%.3fs (discover+fetch=%.3fs translate=%.3fs write=%.3fs)",
+        "rows_in=%d rows_out=%d best_bound_deletes=%d "
+        "exposed_level_inserts=%d total=%.3fs "
+        "(discover+fetch=%.3fs translate=%.3fs write=%.3fs)",
         target.target_kind.value,
         target.target_key,
         date,
@@ -448,6 +470,8 @@ def build_pm_slice(
         record.byte_count,
         stats.rows_in,
         stats.rows_out,
+        stats.best_bound_deletes,
+        stats.exposed_level_inserts,
         perf_counter() - started_at,
         stats.fetch_seconds,
         stats.translate_seconds,
@@ -526,6 +550,57 @@ def _build_schedule_table(
     return pa.Table.from_pylist(rows, schema=SCHEDULE_PARQUET_SCHEMA)
 
 
+def _load_existing_pm_schedule_table(
+    *,
+    existing: CanonicalShardRecord | None,
+    target: PolymarketTarget,
+    s3_store: S3Store,
+    schedule_key: str,
+) -> pa.Table | None:
+    if existing is None or existing.schedule_file is None:
+        return None
+    if existing.schedule_file.s3_key != schedule_key:
+        return None
+    if s3_store.object_size(schedule_key) is None:
+        return None
+    table = pq.read_table(io.BytesIO(s3_store.get_bytes(schedule_key))).cast(
+        SCHEDULE_PARQUET_SCHEMA
+    )
+    if table.num_rows != existing.schedule_file.row_count:
+        logger.warning(
+            "pm slice existing schedule row count mismatch key=%s catalog=%d parquet=%d",
+            schedule_key,
+            existing.schedule_file.row_count,
+            table.num_rows,
+        )
+        return None
+    for row in table.to_pylist():
+        if row["target_kind"] != target.target_kind.value or row["target_key"] != target.target_key:
+            logger.warning(
+                "pm slice existing schedule target mismatch key=%s row_target=%s:%s expected=%s:%s",
+                schedule_key,
+                row["target_kind"],
+                row["target_key"],
+                target.target_kind.value,
+                target.target_key,
+            )
+            return None
+    if not _asset_to_instrument_from_schedule(table):
+        return None
+    return table
+
+
+def _asset_to_instrument_from_schedule(schedule_table: pa.Table) -> dict[str, str]:
+    asset_to_instrument: dict[str, str] = {}
+    for row in schedule_table.to_pylist():
+        for outcome in row["outcomes"] or []:
+            asset_id = outcome.get("asset_id")
+            instrument = outcome.get("instrument")
+            if asset_id and instrument:
+                asset_to_instrument[str(asset_id)] = str(instrument)
+    return asset_to_instrument
+
+
 _PMXT_TRANSLATE_SQL_TEMPLATE = """
 WITH filtered AS (
     SELECT
@@ -538,6 +613,8 @@ WITH filtered AS (
         p.asks,
         CASE WHEN p.price IS NULL THEN NULL ELSE CAST(p.price AS DOUBLE) END AS px_raw,
         CASE WHEN p."size" IS NULL THEN NULL ELSE CAST(p."size" AS DOUBLE) END AS sz_raw,
+        CASE WHEN p.best_bid IS NULL THEN NULL ELSE CAST(p.best_bid AS DOUBLE) END AS best_bid_raw,
+        CASE WHEN p.best_ask IS NULL THEN NULL ELSE CAST(p.best_ask AS DOUBLE) END AS best_ask_raw,
         CASE
             WHEN UPPER(p.side) = 'BUY'  THEN 'Buy'
             WHEN UPPER(p.side) = 'SELL' THEN 'Sell'
@@ -547,52 +624,145 @@ WITH filtered AS (
     INNER JOIN asset_lookup AS l USING (asset_id)
     WHERE p.event_type IN ('book', 'price_change', 'last_trade_price')
 ),
-parsed AS (
+book_parsed AS (
     SELECT
         ts_ms,
         source_hour,
         source_row_number,
         instrument,
-        CASE event_type
-            WHEN 'book'             THEN 'l2_snapshot'
-            WHEN 'price_change'     THEN 'delta_batch'
-            WHEN 'last_trade_price' THEN 'trade'
-        END AS kind,
+        event_type,
+        px_raw,
+        sz_raw,
+        side_norm,
+        best_bid_raw,
+        best_ask_raw,
         CASE WHEN event_type = 'book' THEN
-            list_transform(
-                json_extract(bids, '$[*]')[1:{depth}],
-                x -> {{
-                    'px': CAST(json_extract_string(x, '$.price') AS DOUBLE),
-                    'sz': CAST(json_extract_string(x, '$.size')  AS DOUBLE),
-                    'n':  CAST(0 AS UINTEGER)
-                }}
+            list_reverse_sort(
+                list_filter(
+                    list_transform(
+                        json_extract(bids, '$[*]'),
+                        x -> {{
+                            'px': CAST(COALESCE(json_extract_string(x, '$.price'), json_extract_string(x, '$[0]')) AS DOUBLE),
+                            'sz': CAST(COALESCE(json_extract_string(x, '$.size'),  json_extract_string(x, '$[1]')) AS DOUBLE),
+                            'n':  CAST(0 AS UINTEGER)
+                        }}
+                    ),
+                    x -> x.px IS NOT NULL AND x.sz IS NOT NULL
+                )
             )
-        END AS bids,
+        END AS full_bids,
         CASE WHEN event_type = 'book' THEN
-            list_transform(
-                json_extract(asks, '$[*]')[1:{depth}],
-                x -> {{
-                    'px': CAST(json_extract_string(x, '$.price') AS DOUBLE),
-                    'sz': CAST(json_extract_string(x, '$.size')  AS DOUBLE),
-                    'n':  CAST(0 AS UINTEGER)
-                }}
+            list_sort(
+                list_filter(
+                    list_transform(
+                        json_extract(asks, '$[*]'),
+                        x -> {{
+                            'px': CAST(COALESCE(json_extract_string(x, '$.price'), json_extract_string(x, '$[0]')) AS DOUBLE),
+                            'sz': CAST(COALESCE(json_extract_string(x, '$.size'),  json_extract_string(x, '$[1]')) AS DOUBLE),
+                            'n':  CAST(0 AS UINTEGER)
+                        }}
+                    ),
+                    x -> x.px IS NOT NULL AND x.sz IS NOT NULL
+                )
             )
-        END AS asks,
-        CASE WHEN event_type = 'price_change'
-                  AND side_norm IS NOT NULL
-                  AND px_raw IS NOT NULL
-                  AND sz_raw IS NOT NULL THEN
-            [{{
+        END AS full_asks
+    FROM filtered
+),
+book_rows AS (
+    SELECT
+        ts_ms,
+        source_hour,
+        source_row_number,
+        instrument,
+        'l2_snapshot' AS kind,
+        list_slice(full_bids, 1, {depth}) AS bids,
+        list_slice(full_asks, 1, {depth}) AS asks,
+        full_bids,
+        full_asks,
+        NULL AS delta_levels,
+        NULL AS px,
+        NULL AS sz,
+        NULL AS side,
+        NULL AS best_bid,
+        NULL AS best_ask
+    FROM book_parsed
+    WHERE event_type = 'book'
+),
+delta_level_collapsed AS (
+    SELECT
+        ts_ms,
+        source_hour,
+        MIN(source_row_number) AS source_row_number,
+        instrument,
+        side_norm,
+        px_raw,
+        MIN(sz_raw) AS sz_raw,
+        MAX(best_bid_raw) AS best_bid_raw,
+        MIN(best_ask_raw) AS best_ask_raw
+    FROM book_parsed
+    WHERE event_type = 'price_change'
+      AND side_norm IS NOT NULL
+      AND px_raw IS NOT NULL
+      AND sz_raw IS NOT NULL
+    GROUP BY ts_ms, source_hour, instrument, side_norm, px_raw
+),
+delta_rows AS (
+    SELECT
+        ts_ms,
+        source_hour,
+        MIN(source_row_number) AS source_row_number,
+        instrument,
+        'delta_batch' AS kind,
+        NULL AS bids,
+        NULL AS asks,
+        NULL AS full_bids,
+        NULL AS full_asks,
+        list(
+            {{
                 'side': side_norm,
                 'px':   px_raw,
                 'sz':   sz_raw,
                 'n':    CAST(0 AS UINTEGER)
-            }}]
-        END AS delta_levels,
-        CASE WHEN event_type = 'last_trade_price' THEN px_raw END AS px,
-        CASE WHEN event_type = 'last_trade_price' THEN sz_raw END AS sz,
-        CASE WHEN event_type = 'last_trade_price' THEN side_norm END AS side
-    FROM filtered
+            }}
+            ORDER BY side_norm, px_raw
+        ) AS delta_levels,
+        NULL AS px,
+        NULL AS sz,
+        NULL AS side,
+        MAX(best_bid_raw) AS best_bid,
+        MIN(best_ask_raw) AS best_ask
+    FROM delta_level_collapsed
+    GROUP BY ts_ms, source_hour, instrument
+),
+trade_rows AS (
+    SELECT
+        ts_ms,
+        source_hour,
+        source_row_number,
+        instrument,
+        'trade' AS kind,
+        NULL AS bids,
+        NULL AS asks,
+        NULL AS full_bids,
+        NULL AS full_asks,
+        NULL AS delta_levels,
+        px_raw AS px,
+        sz_raw AS sz,
+        side_norm AS side,
+        NULL AS best_bid,
+        NULL AS best_ask
+    FROM book_parsed
+    WHERE event_type = 'last_trade_price'
+      AND px_raw IS NOT NULL
+      AND sz_raw IS NOT NULL
+      AND side_norm IS NOT NULL
+),
+parsed AS (
+    SELECT * FROM book_rows
+    UNION ALL
+    SELECT * FROM delta_rows
+    UNION ALL
+    SELECT * FROM trade_rows
 )
 SELECT
     ts_ms,
@@ -602,10 +772,14 @@ SELECT
     kind,
     bids,
     asks,
+    full_bids,
+    full_asks,
     delta_levels,
     px,
     sz,
-    side
+    side,
+    best_bid,
+    best_ask
 FROM parsed
 WHERE
     (kind = 'l2_snapshot') OR
@@ -616,10 +790,6 @@ WHERE
 
 def _duckdb_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
-
-
-def _duckdb_string_list(values: Iterable[str]) -> str:
-    return "[" + ", ".join(_duckdb_literal(value) for value in values) + "]"
 
 
 def _slice_pmxt_for_date(
@@ -707,26 +877,12 @@ def _slice_pmxt_for_date(
                 )
 
             if translated_paths:
-                files = _duckdb_string_list(str(path) for path in translated_paths)
-                con.execute(
-                    f"""
-                    COPY (
-                        SELECT
-                            ts_ms,
-                            instrument,
-                            kind,
-                            bids,
-                            asks,
-                            delta_levels,
-                            px,
-                            sz,
-                            side
-                        FROM read_parquet({files}, union_by_name=true)
-                        ORDER BY ts_ms, source_hour, source_row_number
-                    )
-                    TO {_duckdb_literal(str(data_parquet_path))}
-                    (FORMAT PARQUET, COMPRESSION ZSTD)
-                    """
+                rows_out_total = _write_pm_repaired_day_file(
+                    con=con,
+                    translated_paths=translated_paths,
+                    data_parquet_path=data_parquet_path,
+                    depth=depth,
+                    stats=stats,
                 )
             else:
                 empty_table = pa.Table.from_pydict(
@@ -744,6 +900,506 @@ def _slice_pmxt_for_date(
 
     stats.rows_out = rows_out_total
     return rows_out_total
+
+
+@dataclass
+class _PMBookRepairState:
+    full_bids: dict[float, tuple[float, float]]
+    full_asks: dict[float, tuple[float, float]]
+    published_bids: dict[float, tuple[float, float]]
+    published_asks: dict[float, tuple[float, float]]
+    best_bid: float | None = None
+    best_ask: float | None = None
+    last_ts_ms: int | None = None
+    touched_bid_keys: set[float] | None = None
+    touched_ask_keys: set[float] | None = None
+
+
+@dataclass
+class _PMTranslatedCursor:
+    batches: Any
+    source_index: int
+    columns: dict[str, list] | None = None
+    index: int = 0
+    batch_rows: int = 0
+
+    def load_next_batch(self) -> bool:
+        try:
+            batch = next(self.batches)
+        except StopIteration:
+            self.columns = None
+            self.index = 0
+            self.batch_rows = 0
+            return False
+        self.columns = {name: batch.column(name).to_pylist() for name in batch.schema.names}
+        self.index = 0
+        self.batch_rows = batch.num_rows
+        return True
+
+    def advance(self) -> bool:
+        self.index += 1
+        if self.index < self.batch_rows:
+            return True
+        return self.load_next_batch()
+
+    def key(self) -> tuple[int, int, int, int]:
+        assert self.columns is not None
+        return (
+            self.columns["ts_ms"][self.index],
+            self.columns["source_hour"][self.index],
+            self.columns["source_row_number"][self.index],
+            self.source_index,
+        )
+
+
+def _write_pm_repaired_day_file(
+    *,
+    con,
+    translated_paths: list[Path],
+    data_parquet_path: Path,
+    depth: int,
+    stats: PMSliceStats,
+) -> int:
+    """Write final PM canonical rows, repairing depth-limited PMXT replay.
+
+    PMXT price_change rows carry best_bid/best_ask. The raw level updates can
+    otherwise leave stale superior levels in replay state, which creates crossed
+    books. PMXT book snapshots are full-depth, but canonical snapshots are
+    depth-limited; when deletes expose a deeper level, we append a synthetic
+    insert so a depth-limited replay still reconstructs the current top book.
+    """
+    states: dict[str, _PMBookRepairState] = {}
+    rows_written = 0
+    writer: pq.ParquetWriter | None = None
+    out: dict[str, list] = {field.name: [] for field in DATA_PARQUET_SCHEMA}
+    cursors: list[_PMTranslatedCursor] = []
+    heap: list[tuple[int, int, int, int]] = []
+
+    def flush_out() -> None:
+        nonlocal writer, rows_written, out
+        if not out["ts_ms"]:
+            return
+        table = pa.Table.from_pydict(out, schema=DATA_PARQUET_SCHEMA)
+        if writer is None:
+            writer = pq.ParquetWriter(
+                data_parquet_path,
+                DATA_PARQUET_SCHEMA,
+                compression="zstd",
+                use_dictionary=["instrument", "kind", "side"],
+            )
+        writer.write_table(table)
+        rows_written += table.num_rows
+        if rows_written % 1_048_576 < table.num_rows:
+            logger.info(
+                "pm slice repaired rows=%d best_bound_deletes=%d exposed_level_inserts=%d",
+                rows_written,
+                stats.best_bound_deletes,
+                stats.exposed_level_inserts,
+            )
+        out = {field.name: [] for field in DATA_PARQUET_SCHEMA}
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="pmxt-sorted-") as sorted_dir_raw:
+            sorted_dir = Path(sorted_dir_raw)
+            for source_index, translated_path in enumerate(translated_paths):
+                sorted_path = sorted_dir / f"translated-sorted-{source_index:02d}.parquet"
+                con.execute(
+                    f"""
+                    COPY (
+                        SELECT
+                            ts_ms,
+                            source_hour,
+                            source_row_number,
+                            instrument,
+                            kind,
+                            bids,
+                            asks,
+                            full_bids,
+                            full_asks,
+                            delta_levels,
+                            px,
+                            sz,
+                            side,
+                            best_bid,
+                            best_ask
+                        FROM read_parquet({_duckdb_literal(str(translated_path))}, union_by_name=true)
+                        ORDER BY ts_ms, source_row_number
+                    )
+                    TO {_duckdb_literal(str(sorted_path))}
+                    (FORMAT PARQUET, COMPRESSION ZSTD)
+                    """
+                )
+
+                batches = pq.ParquetFile(sorted_path).iter_batches(batch_size=65_536)
+                cursor = _PMTranslatedCursor(batches=batches, source_index=source_index)
+                if cursor.load_next_batch():
+                    cursors.append(cursor)
+                    heappush(heap, cursor.key())
+
+            while heap:
+                _ts_ms, _source_hour, _source_row_number, source_index = heappop(heap)
+                cursor = cursors[source_index]
+                assert cursor.columns is not None
+                _append_repaired_pm_row(
+                    cursor.columns,
+                    cursor.index,
+                    states=states,
+                    stats=stats,
+                    depth=depth,
+                    out=out,
+                )
+                if len(out["ts_ms"]) >= 65_536:
+                    flush_out()
+                if cursor.advance():
+                    heappush(heap, cursor.key())
+
+        flush_out()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if writer is None:
+        empty_table = pa.Table.from_pydict(
+            {field.name: [] for field in DATA_PARQUET_SCHEMA},
+            schema=DATA_PARQUET_SCHEMA,
+        )
+        pq.write_table(
+            empty_table,
+            data_parquet_path,
+            compression="zstd",
+            use_dictionary=["instrument", "kind", "side"],
+        )
+    return rows_written
+
+
+def _append_repaired_pm_row(
+    columns: dict[str, list],
+    idx: int,
+    *,
+    states: dict[str, _PMBookRepairState],
+    stats: PMSliceStats,
+    depth: int,
+    out: dict[str, list],
+) -> None:
+    instrument = columns["instrument"][idx]
+    kind = columns["kind"][idx]
+    state = states.setdefault(
+        instrument,
+        _PMBookRepairState(
+            full_bids={},
+            full_asks={},
+            published_bids={},
+            published_asks={},
+        ),
+    )
+
+    bids = columns["bids"][idx]
+    asks = columns["asks"][idx]
+    delta_levels = columns["delta_levels"][idx]
+    if kind == DataEventKind.L2_SNAPSHOT.value:
+        full_bids = columns["full_bids"][idx] if "full_bids" in columns else bids
+        full_asks = columns["full_asks"][idx] if "full_asks" in columns else asks
+        _replace_pm_repair_book(
+            state,
+            bids=bids,
+            asks=asks,
+            full_bids=full_bids,
+            full_asks=full_asks,
+        )
+    elif kind == DataEventKind.DELTA_BATCH.value:
+        delta_levels = _repair_pm_delta_levels(
+            state,
+            ts_ms=columns["ts_ms"][idx],
+            delta_levels=delta_levels,
+            best_bid=columns["best_bid"][idx],
+            best_ask=columns["best_ask"][idx],
+            depth=depth,
+            stats=stats,
+        )
+
+    out["ts_ms"].append(columns["ts_ms"][idx])
+    out["instrument"].append(instrument)
+    out["kind"].append(kind)
+    out["bids"].append(bids)
+    out["asks"].append(asks)
+    out["delta_levels"].append(delta_levels)
+    out["px"].append(columns["px"][idx])
+    out["sz"].append(columns["sz"][idx])
+    out["side"].append(columns["side"][idx])
+
+
+def _replace_pm_repair_book(
+    state: _PMBookRepairState,
+    *,
+    bids: list[dict[str, Any]] | None,
+    asks: list[dict[str, Any]] | None,
+    full_bids: list[dict[str, Any]] | None,
+    full_asks: list[dict[str, Any]] | None,
+) -> None:
+    state.full_bids = _pm_levels_to_state(full_bids if full_bids is not None else bids)
+    state.full_asks = _pm_levels_to_state(full_asks if full_asks is not None else asks)
+    state.published_bids = _pm_levels_to_state(bids)
+    state.published_asks = _pm_levels_to_state(asks)
+    state.best_bid = max(state.full_bids) if state.full_bids else None
+    state.best_ask = min(state.full_asks) if state.full_asks else None
+
+
+def _pm_levels_to_state(levels: list[dict[str, Any]] | None) -> dict[float, tuple[float, float]]:
+    state: dict[float, tuple[float, float]] = {}
+    for level in levels or []:
+        px = _pm_float(level.get("px"))
+        sz = _pm_float(level.get("sz"))
+        if px is None or sz is None or sz <= 0.0:
+            continue
+        state[_pm_price_key(px)] = (px, sz)
+    return state
+
+
+def _prepare_pm_repair_timestamp(state: _PMBookRepairState, ts_ms: int) -> None:
+    if state.last_ts_ms == ts_ms:
+        return
+    state.last_ts_ms = ts_ms
+    state.touched_bid_keys = set()
+    state.touched_ask_keys = set()
+
+
+def _repair_pm_delta_levels(
+    state: _PMBookRepairState,
+    *,
+    ts_ms: int,
+    delta_levels: list[dict[str, Any]] | None,
+    best_bid: Any,
+    best_ask: Any,
+    depth: int,
+    stats: PMSliceStats,
+) -> list[dict[str, Any]] | None:
+    if delta_levels is None:
+        return None
+    _prepare_pm_repair_timestamp(state, ts_ms)
+    repaired = [dict(level) for level in delta_levels]
+    updated_bid_keys: list[float] = []
+    updated_ask_keys: list[float] = []
+    for level in repaired:
+        updated = _apply_pm_repair_level(state, level)
+        if updated is None:
+            continue
+        side, key = updated
+        if side == "Buy":
+            updated_bid_keys.append(key)
+        else:
+            updated_ask_keys.append(key)
+
+    best_bid_px = _pm_float(best_bid)
+    publish_bids = False
+    if best_bid_px is not None:
+        publish_bids = state.best_bid is None or abs(best_bid_px - state.best_bid) > 1e-9
+        if state.best_bid is None or best_bid_px < state.best_bid - 1e-9:
+            _remove_pm_stale_levels_without_output(
+                state.full_bids,
+                predicate=lambda px: px > best_bid_px + 1e-9,
+                skip_keys=state.touched_bid_keys,
+            )
+            repaired.extend(
+                _remove_pm_stale_levels(
+                    state.published_bids,
+                    side="Buy",
+                    predicate=lambda px: px > best_bid_px + 1e-9,
+                    skip_keys=state.touched_bid_keys,
+                    stats=stats,
+                )
+            )
+        else:
+            _remove_pm_stale_updated_levels_without_output(
+                state.full_bids,
+                updated_keys=updated_bid_keys,
+                predicate=lambda px: px > best_bid_px + 1e-9,
+            )
+            repaired.extend(
+                _remove_pm_stale_updated_levels(
+                    state.published_bids,
+                    side="Buy",
+                    updated_keys=updated_bid_keys,
+                    predicate=lambda px: px > best_bid_px + 1e-9,
+                    stats=stats,
+                )
+            )
+        state.best_bid = max(state.full_bids) if state.full_bids else best_bid_px
+
+    best_ask_px = _pm_float(best_ask)
+    publish_asks = False
+    if best_ask_px is not None:
+        publish_asks = state.best_ask is None or abs(best_ask_px - state.best_ask) > 1e-9
+        if state.best_ask is None or best_ask_px > state.best_ask + 1e-9:
+            _remove_pm_stale_levels_without_output(
+                state.full_asks,
+                predicate=lambda px: px < best_ask_px - 1e-9,
+                skip_keys=state.touched_ask_keys,
+            )
+            repaired.extend(
+                _remove_pm_stale_levels(
+                    state.published_asks,
+                    side="Sell",
+                    predicate=lambda px: px < best_ask_px - 1e-9,
+                    skip_keys=state.touched_ask_keys,
+                    stats=stats,
+                )
+            )
+        else:
+            _remove_pm_stale_updated_levels_without_output(
+                state.full_asks,
+                updated_keys=updated_ask_keys,
+                predicate=lambda px: px < best_ask_px - 1e-9,
+            )
+            repaired.extend(
+                _remove_pm_stale_updated_levels(
+                    state.published_asks,
+                    side="Sell",
+                    updated_keys=updated_ask_keys,
+                    predicate=lambda px: px < best_ask_px - 1e-9,
+                    stats=stats,
+                )
+            )
+        state.best_ask = min(state.full_asks) if state.full_asks else best_ask_px
+    if publish_bids:
+        repaired.extend(_publish_pm_exposed_levels(state, side="Buy", depth=depth, stats=stats))
+    if publish_asks:
+        repaired.extend(_publish_pm_exposed_levels(state, side="Sell", depth=depth, stats=stats))
+    return repaired
+
+
+def _apply_pm_repair_level(
+    state: _PMBookRepairState, level: dict[str, Any]
+) -> tuple[str, float] | None:
+    px = _pm_float(level.get("px"))
+    sz = _pm_float(level.get("sz"))
+    side = level.get("side")
+    if px is None or sz is None or side not in {"Buy", "Sell"}:
+        return None
+    key = _pm_price_key(px)
+    full_book = state.full_bids if side == "Buy" else state.full_asks
+    published_book = state.published_bids if side == "Buy" else state.published_asks
+    _set_pm_book_level(full_book, key=key, px=px, sz=sz)
+    _set_pm_book_level(published_book, key=key, px=px, sz=sz)
+    touched = state.touched_bid_keys if side == "Buy" else state.touched_ask_keys
+    if touched is not None:
+        touched.add(key)
+    return side, key
+
+
+def _set_pm_book_level(
+    book: dict[float, tuple[float, float]],
+    *,
+    key: float,
+    px: float,
+    sz: float,
+) -> None:
+    if sz <= 0.0:
+        book.pop(key, None)
+    else:
+        book[key] = (px, sz)
+
+
+def _remove_pm_stale_levels_without_output(
+    book: dict[float, tuple[float, float]],
+    *,
+    predicate: Callable[[float], bool],
+    skip_keys: set[float] | None = None,
+) -> None:
+    for key, (px, _sz) in list(book.items()):
+        if skip_keys is not None and key in skip_keys:
+            continue
+        if predicate(px):
+            book.pop(key, None)
+
+
+def _remove_pm_stale_updated_levels_without_output(
+    book: dict[float, tuple[float, float]],
+    *,
+    updated_keys: list[float],
+    predicate: Callable[[float], bool],
+) -> None:
+    for key in updated_keys:
+        level = book.get(key)
+        if level is None:
+            continue
+        px, _sz = level
+        if predicate(px):
+            book.pop(key, None)
+
+
+def _publish_pm_exposed_levels(
+    state: _PMBookRepairState,
+    *,
+    side: str,
+    depth: int,
+    stats: PMSliceStats,
+) -> list[dict[str, Any]]:
+    full_book = state.full_bids if side == "Buy" else state.full_asks
+    published_book = state.published_bids if side == "Buy" else state.published_asks
+    reverse = side == "Buy"
+    inserts: list[dict[str, Any]] = []
+    for key in sorted(full_book, reverse=reverse)[:depth]:
+        px, sz = full_book[key]
+        published = published_book.get(key)
+        if published is not None and abs(published[1] - sz) <= 1e-9:
+            continue
+        published_book[key] = (px, sz)
+        inserts.append({"side": side, "px": px, "sz": sz, "n": 0})
+    stats.exposed_level_inserts += len(inserts)
+    return inserts
+
+
+def _remove_pm_stale_levels(
+    book: dict[float, tuple[float, float]],
+    *,
+    side: str,
+    predicate: Callable[[float], bool],
+    skip_keys: set[float] | None = None,
+    stats: PMSliceStats,
+) -> list[dict[str, Any]]:
+    deletes: list[dict[str, Any]] = []
+    for key, (px, _sz) in list(book.items()):
+        if skip_keys is not None and key in skip_keys:
+            continue
+        if predicate(px):
+            book.pop(key, None)
+            deletes.append({"side": side, "px": px, "sz": 0.0, "n": 0})
+    stats.best_bound_deletes += len(deletes)
+    return deletes
+
+
+def _remove_pm_stale_updated_levels(
+    book: dict[float, tuple[float, float]],
+    *,
+    side: str,
+    updated_keys: list[float],
+    predicate: Callable[[float], bool],
+    stats: PMSliceStats,
+) -> list[dict[str, Any]]:
+    deletes: list[dict[str, Any]] = []
+    for key in updated_keys:
+        level = book.get(key)
+        if level is None:
+            continue
+        px, _sz = level
+        if predicate(px):
+            book.pop(key, None)
+            deletes.append({"side": side, "px": px, "sz": 0.0, "n": 0})
+    stats.best_bound_deletes += len(deletes)
+    return deletes
+
+
+def _pm_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pm_price_key(px: float) -> float:
+    return round(px, 9)
 
 
 def _fetch_pmxt_payload(s3_store: S3Store, date: str, hour: int) -> bytes:
@@ -825,8 +1481,8 @@ def _translate_pmxt_payload(
 
         if event_type == "book":
             out["kind"].append(DataEventKind.L2_SNAPSHOT.value)
-            out["bids"].append(_parse_book_levels(bids_raw[idx], depth=depth))
-            out["asks"].append(_parse_book_levels(asks_raw[idx], depth=depth))
+            out["bids"].append(_parse_book_levels(bids_raw[idx], depth=depth, side="bid"))
+            out["asks"].append(_parse_book_levels(asks_raw[idx], depth=depth, side="ask"))
             out["delta_levels"].append(None)
             out["px"].append(None)
             out["sz"].append(None)
@@ -865,7 +1521,12 @@ def _translate_pmxt_payload(
     return out
 
 
-def _parse_book_levels(raw: str | None, *, depth: int) -> list[dict[str, Any]] | None:
+def _parse_book_levels(
+    raw: str | None,
+    *,
+    depth: int,
+    side: str,
+) -> list[dict[str, Any]] | None:
     if not raw:
         return []
     try:
@@ -875,16 +1536,28 @@ def _parse_book_levels(raw: str | None, *, depth: int) -> list[dict[str, Any]] |
     if not isinstance(levels, list):
         return []
     out: list[dict[str, Any]] = []
-    for level in levels[:depth]:
-        if not isinstance(level, dict):
+    for level in levels:
+        if isinstance(level, dict):
+            raw_px = level.get("price", level.get("p"))
+            raw_sz = level.get("size", level.get("s", 0.0))
+        elif isinstance(level, list | tuple) and len(level) >= 2:
+            raw_px = level[0]
+            raw_sz = level[1]
+        else:
             continue
         try:
-            px = float(level.get("price", level.get("p")))
-            sz = float(level.get("size", level.get("s", 0.0)))
+            px = float(raw_px)
+            sz = float(raw_sz)
         except (TypeError, ValueError):
             continue
         out.append({"px": px, "sz": sz, "n": 0})
-    return out
+    if side == "bid":
+        out.sort(key=lambda item: item["px"], reverse=True)
+    elif side == "ask":
+        out.sort(key=lambda item: item["px"])
+    else:
+        raise ValueError(f"unsupported book side: {side}")
+    return out[:depth]
 
 
 def _build_delta_level(*, side: Any, price: Any, size: Any) -> dict[str, Any] | None:

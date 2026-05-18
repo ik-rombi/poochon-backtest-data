@@ -123,6 +123,10 @@ There are two venue families today:
     - `canonical/polymarket/<series|slug>/<target_key>/date=<YYYY-MM-DD>/depth=<N>/data.parquet`
     - `canonical/polymarket/<series|slug>/<target_key>/date=<YYYY-MM-DD>/depth=<N>/schedule.parquet`
     - `canonical/polymarket/<series|slug>/<target_key>/date=<YYYY-MM-DD>/depth=<N>/manifest.json`
+- Validation fixtures
+  - `debug/golden/polymarket/ws-live-2026-05-18T02/manifest.json`
+  - `debug/golden/polymarket/ws-live-2026-05-18T02/basket-book-capture.jsonl.zst`
+  - `debug/golden/polymarket/ws-live-2026-05-18T02/polymarket_orderbook_2026-05-18T02.parquet`
 
 ## Data Structures
 
@@ -191,6 +195,8 @@ asks
 price
 size
 side
+best_bid
+best_ask
 ```
 
 Supported `event_type` values are translated into canonical data rows:
@@ -198,6 +204,11 @@ Supported `event_type` values are translated into canonical data rows:
 - `book` -> `l2_snapshot`
 - `price_change` -> `delta_batch`
 - `last_trade_price` -> `trade`
+
+PMXT book payloads have appeared in both object form (`{"price": "...",
+"size": "..."}`) and array form (`["price", "size"]`). The canonical builder
+accepts both, sorts bids descending and asks ascending, and only then emits the
+depth-limited canonical `bids` / `asks` arrays.
 
 #### Polymarket Schedule Data
 
@@ -213,6 +224,25 @@ historical format consumed by `../bitchon/bot` replay and backtest flows.
 
 Each Hyperliquid shard emits `data.parquet` and `manifest.json`. Each
 Polymarket shard emits `data.parquet`, `schedule.parquet`, and `manifest.json`.
+
+#### Polymarket replay repair
+
+PMXT `price_change` rows include `best_bid` and `best_ask`. The Polymarket
+canonicalizer uses those exchange-provided bounds while building the day shard:
+
+- stale superior levels are deleted when PMXT says they are no longer the best
+  bid or ask
+- full-depth `book` snapshots are retained internally, while the public
+  canonical file remains depth-limited
+- when a delete exposes a deeper level inside the requested depth, the builder
+  emits a synthetic level insert so a depth-limited replay reconstructs the same
+  top book
+- duplicate same-timestamp updates for the same instrument/side/price are
+  collapsed before repair
+
+This repair changes Polymarket canonical content but not the public
+`data.parquet` schema. Earlier Polymarket shards built without this repair are
+not considered trustworthy and should be rebuilt with `--force`.
 
 #### `data.parquet`
 
@@ -312,6 +342,8 @@ poochon-backtest-data
 ├── schedule                        # inspect EventBridge schedules
 │   ├── list
 │   └── next
+├── validate                        # run fixture-backed data validations
+│   └── polymarket-golden
 └── job                             # track AWS executions
     ├── list
     ├── status <execution-arn>
@@ -364,6 +396,54 @@ poochon-backtest-data run polymarket all \
 This mirrors PMXT raw firehose data for the requested window, then builds
 canonical daily slices for the target. Each sub-stage is individually callable
 (`run polymarket mirror`, `run polymarket slice`) if you want to isolate a step.
+
+When refreshing historical Polymarket data after a canonicalizer change, use the
+slice stage with `--force` for every date with complete 24-hour raw PMXT
+coverage:
+
+```bash
+poochon-backtest-data run polymarket slice \
+  --target series:btc-updown-5m \
+  --start-date 2026-04-17 --end-date 2026-04-21 \
+  --force
+
+poochon-backtest-data run polymarket slice \
+  --target series:btc-updown-5m \
+  --start-date 2026-04-25 --end-date 2026-05-17 \
+  --force
+```
+
+Inspect the rebuilt shard catalog afterwards:
+
+```bash
+poochon-backtest-data data polymarket slice series:btc-updown-5m \
+  --start-date 2026-04-17 --end-date 2026-05-17
+```
+
+For a forced rebuild of an already materialized Polymarket shard, the builder
+reuses that shard's existing `schedule.parquet` when it is present and matches
+the target. The canonical `data.parquet` is still regenerated from raw PMXT, but
+the slow external schedule discovery step is skipped for those dates.
+
+### Polymarket golden validation
+
+The 2026-05-18T02 fixture preserves a live Polymarket WebSocket capture and the
+matching PMXT raw parquet hour. It exists to catch regressions where canonical
+replay diverges from observed live book state even though the output schema still
+looks valid.
+
+```bash
+poochon-backtest-data validate polymarket-golden \
+  --fixture-prefix s3://poochon-backtest-data-711396989228-us-east-1-dev-east/debug/golden/polymarket/ws-live-2026-05-18T02 \
+  --work-dir /tmp/pm-golden-2026-05-18T02
+```
+
+The validator downloads the fixture, derives token-to-instrument mapping from
+the WS capture, rebuilds canonical output from the PMXT raw hour, reconstructs
+live book state, and compares the two. Hard gates are zero missing canonical
+states, zero crossed reconstructed books, top-1 exact price rate at least
+`0.999`, top-1 within-one-tick rate at least `0.9999`, and top-5 exact price
+rate at least `0.99`. Size agreement is reported but not a hard gate.
 
 ### Stack Lifecycle
 

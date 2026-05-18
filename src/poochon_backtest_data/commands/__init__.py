@@ -13,12 +13,12 @@ class CommandModule(Protocol):
 
 
 def build_parser() -> ArgumentParser:
-    from . import data, infra, job, run, schedule, submit
+    from . import data, infra, job, run, schedule, submit, validate
 
     parser = ArgumentParser(prog="poochon-backtest-data")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    modules = [infra, data, run, submit, schedule, job]
+    modules = [infra, data, run, submit, schedule, job, validate]
     dispatch_table: dict[str, CommandModule] = {}
     for module in modules:
         module.register(subparsers)

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, date as date_cls, datetime, time as time_cls, timedelta
 import logging
 from threading import local
+from time import sleep
 from typing import Any
 
 import httpx
@@ -418,14 +419,24 @@ def _discover_series(
 
     def process_slug(slug: str) -> list[PolymarketMarketResolution]:
         http = worker_client()
-        try:
-            payload = _fetch_gamma_market(http, urls=urls, slug=slug)
-            if payload is None:
+        payload: dict[str, Any] | None = None
+        for attempt in range(3):
+            try:
+                payload = _fetch_gamma_market(http, urls=urls, slug=slug)
+                break
+            except Exception as error:
+                if attempt < 2:
+                    sleep(0.25 * (attempt + 1))
+                    continue
+                failures.append(
+                    {
+                        "slug": slug,
+                        "phase": "gamma-fetch",
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
                 return []
-        except Exception as error:
-            failures.append(
-                {"slug": slug, "phase": "gamma-fetch", "error": f"{type(error).__name__}: {error}"}
-            )
+        if payload is None:
             return []
         try:
             start, end, start_ts_ms, end_ts_ms = _contract_window_from_payload(payload)
@@ -512,12 +523,12 @@ def _discover_series(
                 results.append(resolution)
 
     if failures:
-        logger.warning(
-            "discover_resolutions: series=%s finished with %d failures; sample: %s",
-            series_key,
-            len(failures),
-            failures[:5],
+        message = (
+            f"discover_resolutions: series={series_key} finished with {len(failures)} "
+            f"failures; sample: {failures[:5]}"
         )
+        logger.error(message)
+        raise RuntimeError(message)
     logger.info(
         "discover_resolutions: series=%s resolved=%d failed=%d",
         series_key,
